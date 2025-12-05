@@ -1,0 +1,269 @@
+-- DDL version 1.0 
+USE [msdb]
+GO
+
+/****** Object:  Job [DATABASE Alert (WMI Response) For DDL Operation]    Script Date: 5/12/2025 2:28:09 PM ******/
+BEGIN TRANSACTION
+DECLARE @ReturnCode INT
+SELECT @ReturnCode = 0
+/****** Object:  JobCategory [REPL-Alert Response]    Script Date: 5/12/2025 2:28:09 PM ******/
+IF NOT EXISTS (SELECT name FROM msdb.dbo.syscategories WHERE name=N'REPL-Alert Response' AND category_class=1)
+BEGIN
+EXEC @ReturnCode = msdb.dbo.sp_add_category @class=N'JOB', @type=N'LOCAL', @name=N'REPL-Alert Response'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+END
+
+DECLARE @jobId BINARY(16)
+EXEC @ReturnCode =  msdb.dbo.sp_add_job @job_name=N'DATABASE Alert (WMI Response) For DDL Operation', 
+		@enabled=1, 
+		@notify_level_eventlog=0, 
+		@notify_level_email=0, 
+		@notify_level_netsend=0, 
+		@notify_level_page=0, 
+		@delete_level=0, 
+		@description=N'Sends notifications to DBA when DATABASE DDL event(s) occur(s)', 
+		@category_name=N'REPL-Alert Response', 
+		@owner_login_name=N'sa', @job_id = @jobId OUTPUT
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Send e-mail in response to WMI alert(s)]    Script Date: 5/12/2025 2:28:09 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Send e-mail in response to WMI alert(s)', 
+		@step_id=1, 
+		@cmdexec_success_code=0, 
+		@on_success_action=1, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'DECLARE @class_string NVARCHAR(200), @str_body NVARCHAR(max), @xdoc INT, @doc NVARCHAR(max)
+-- get TSQL Command Text from XML
+SET @doc =''$(ESCAPE_SQUOTE(WMI(TSQLCommand)))''
+EXEC sp_xml_preparedocument @xdoc OUTPUT, @doc
+SELECT   @str_body = ''TSQL Command: "'' + CommandText + ''"; 
+ Database Name: $(ESCAPE_SQUOTE(WMI(DatabaseName)));
+ SQL Server: '' + @@SERVERNAME + '';
+ Post Time: $(ESCAPE_SQUOTE(WMI(PostTime))); 
+ Login Name: $(ESCAPE_SQUOTE(WMI(LoginName)));''
+FROM       OPENXML (@xdoc , ''/TSQLCommand/CommandText'',1)
+      WITH (CommandText  varchar(max) ''text()'')
+EXEC sp_xml_removedocument @xdoc
+-- identify type of the event
+SELECT @class_string = ''"$(ESCAPE_SQUOTE(WMI(DatabaseName)))": $(ESCAPE_SQUOTE(WMI(__CLASS))) event''
+  
+-- send e-mail with database change details
+EXEC msdb.dbo.sp_send_dbmail
+    @profile_name = ''Database Support Profile'', 
+    @recipients = ''os-is-sd-hcl-sql@brisbane.qld.gov.au'',
+    @body = @str_body,
+    @subject = @class_string ;', 
+		@database_name=N'master', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_update_job @job_id = @jobId, @start_step_id = 1
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+COMMIT TRANSACTION
+GOTO EndSave
+QuitWithRollback:
+    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION
+EndSave:
+GO
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+--- ddl version 1.0 
+
+USE [msdb]
+GO
+
+/****** Object:  Job [Monitor SQL Server DDL and User Changes]    Script Date: 5/12/2025 4:41:14 PM ******/
+BEGIN TRANSACTION
+DECLARE @ReturnCode INT
+SELECT @ReturnCode = 0
+/****** Object:  JobCategory [[Uncategorized (Local)]]    Script Date: 5/12/2025 4:41:14 PM ******/
+IF NOT EXISTS (SELECT name FROM msdb.dbo.syscategories WHERE name=N'[Uncategorized (Local)]' AND category_class=1)
+BEGIN
+EXEC @ReturnCode = msdb.dbo.sp_add_category @class=N'JOB', @type=N'LOCAL', @name=N'[Uncategorized (Local)]'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+END
+
+DECLARE @jobId BINARY(16)
+EXEC @ReturnCode =  msdb.dbo.sp_add_job @job_name=N'Monitor SQL Server DDL and User Changes', 
+		@enabled=0, 
+		@notify_level_eventlog=0, 
+		@notify_level_email=0, 
+		@notify_level_netsend=0, 
+		@notify_level_page=0, 
+		@delete_level=0, 
+		@description=N'No description available.', 
+		@category_name=N'[Uncategorized (Local)]', 
+		@owner_login_name=N'sa', @job_id = @jobId OUTPUT
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Monitor SQL Server DDL and User Changes]    Script Date: 5/12/2025 4:41:14 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Monitor SQL Server DDL and User Changes', 
+		@step_id=1, 
+		@cmdexec_success_code=0, 
+		@on_success_action=1, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'PowerShell', 
+		@command=N'# Load the SqlServer module to use SMO and Invoke-Sqlcmd
+Import-Module SqlServer
+
+# Define server details and email settings
+$serverName = "M677DEV1\SEGP01"     # Change to your SQL Server instance
+$dbMailProfile = "DBA_Alert_Notification"  # Database Mail Profile
+$smtpServer = "smtp.bcc.qld.gov.au"      # SMTP server for email
+$toEmail = "nandan.kumar@brisbane.qld.gov.au"          # Recipient email for alerts
+$fromEmail = "M677DEV1-SEGP01@brisbane.qld.gov.au"   # Sender email for alerts
+
+# SQL Queries to monitor login/user changes and DDL events
+$loginQuery = @"
+SELECT login_name, host_name, program_name, login_time 
+FROM sys.dm_exec_sessions
+WHERE login_name NOT IN (''sa'', ''public'')
+"@
+
+$ddlQuery = @"
+SELECT EVENTDATA().value(''(/EVENT_INSTANCE/EventType)[1]'', ''nvarchar(100)'') AS EventType,
+       EVENTDATA().value(''(/EVENT_INSTANCE/ObjectName)[1]'', ''nvarchar(255)'') AS ObjectName,
+       EVENTDATA().value(''(/EVENT_INSTANCE/TSQLText)[1]'', ''nvarchar(1000)'') AS TSQLText
+FROM sys.fn_xe_file_target_read_file(''system_health*.xel'', NULL, NULL, NULL)
+WHERE EVENTDATA().value(''(/EVENT_INSTANCE/EventType)[1]'', ''nvarchar(100)'') IN (''CREATE_TABLE'', ''ALTER_TABLE'', ''DROP_TABLE'', ''CREATE_PROCEDURE'', ''ALTER_PROCEDURE'', ''DROP_PROCEDURE'')
+"@
+
+# SQL Query to monitor object-level changes (e.g., schema modifications)
+$objectChangesQuery = @"
+SELECT 
+    OBJECT_NAME(object_id) AS ObjectName,
+    type_desc AS ObjectType,
+    modify_date
+FROM sys.objects
+WHERE modify_date > DATEADD(HOUR, -1, GETDATE())  -- Modified within the last hour
+"@
+
+# Function to send an email
+function Send-EmailNotification($subject, $body) {
+    $smtp = New-Object Net.Mail.SmtpClient($smtpServer)
+    $smtp.Send($fromEmail, $toEmail, $subject, $body)
+}
+
+# Monitor Login/User Changes
+function Monitor-LoginChanges {
+    try {
+        $loginResults = Invoke-Sqlcmd -ServerInstance $serverName -Query $loginQuery -Database master
+        foreach ($row in $loginResults) {
+            $loginName = $row.login_name
+            $hostName = $row.host_name
+            $programName = $row.program_name
+            $loginTime = $row.login_time
+            $message = "Login Detected: User ''$loginName'' logged in from ''$hostName'' using ''$programName'' at $loginTime."
+            
+            # Send Email Notification
+            Send-EmailNotification "SQL Server Login/User Change Alert" $message
+            Write-Host $message
+        }
+    }
+    catch {
+        Write-Host "Error monitoring login changes: $_"
+    }
+}
+
+# Monitor DDL Events
+function Monitor-DDLEvents {
+    try {
+        $ddlResults = Invoke-Sqlcmd -ServerInstance $serverName -Query $ddlQuery -Database master
+        foreach ($event in $ddlResults) {
+            $eventType = $event.EventType
+            $objectName = $event.ObjectName
+            $sqlText = $event.TSQLText
+            $message = "DDL Event Detected: $eventType on object ''$objectName''. SQL Text: $sqlText"
+            
+            # Send Email Notification
+            Send-EmailNotification "SQL Server DDL Event Alert" $message
+            Write-Host $message
+        }
+    }
+    catch {
+        Write-Host "Error monitoring DDL events: $_"
+    }
+}
+
+# Monitor Object-Level Changes (based on last modification date)
+function Monitor-ObjectChanges {
+    try {
+        $objectChanges = Invoke-Sqlcmd -ServerInstance $serverName -Query $objectChangesQuery -Database master
+        foreach ($row in $objectChanges) {
+            $objectName = $row.ObjectName
+            $objectType = $row.ObjectType
+            $modifyDate = $row.modify_date
+            $message = "Object-Level Change Detected: Object ''$objectName'' of type ''$objectType'' was modified at $modifyDate."
+            
+            # Send Email Notification
+            Send-EmailNotification "SQL Server Object-Level Change Alert" $message
+            Write-Host $message
+        }
+    }
+    catch {
+        Write-Host "Error monitoring object changes: $_"
+    }
+}
+
+# Main Monitoring Loop
+while ($true) {
+    Write-Host "Monitoring SQL Server for login/user changes, DDL events, and object-level changes..."
+
+    # Monitor login/user changes
+    Monitor-LoginChanges
+
+    # Monitor DDL events
+    Monitor-DDLEvents
+
+    # Monitor object-level changes
+    Monitor-ObjectChanges
+
+    # Wait for a period before the next check (e.g., 5 minutes)
+    Start-Sleep -Seconds 300  # Adjust as necessary
+}
+
+
+', 
+		@database_name=N'master', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_update_job @job_id = @jobId, @start_step_id = 1
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule @job_id=@jobId, @name=N'Monitor SQL Server DDL and User Changes', 
+		@enabled=1, 
+		@freq_type=4, 
+		@freq_interval=1, 
+		@freq_subday_type=1, 
+		@freq_subday_interval=5, 
+		@freq_relative_interval=0, 
+		@freq_recurrence_factor=0, 
+		@active_start_date=20250103, 
+		@active_end_date=99991231, 
+		@active_start_time=0, 
+		@active_end_time=235959, 
+		@schedule_uid=N'd41ea987-4cdd-4843-b3fa-ef204fce28f8'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+COMMIT TRANSACTION
+GOTO EndSave
+QuitWithRollback:
+    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION
+EndSave:
+GO
+
+
+
+
