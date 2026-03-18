@@ -1,0 +1,7 @@
+SELECT sqlserver_start_time 
+FROM sys.dm_os_sys_info;
+
+SELECT TOP 1 
+    agent_start_date AS SQLAgentStartTime
+FROM msdb.dbo.syssessions
+ORDER BY agent_start_date DESC;
