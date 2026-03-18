@@ -1,0 +1,93 @@
+1. ---------------------SQL Server Wait Stats (Top indicator)
+
+SELECT TOP 10 
+    wait_type, 
+    wait_time_ms/1000.0 AS WaitTimeSec,
+    signal_wait_time_ms/1000.0 AS SignalWaitSec
+FROM sys.dm_os_wait_stats
+WHERE wait_type LIKE 'PAGEIOLATCH%'
+ORDER BY wait_time_ms DESC;
+
+
+
+2. ----File Level IO Stats
+
+
+SELECT 
+    DB_NAME(database_id) AS DBName,
+    file_id,
+    num_of_reads,
+    num_of_writes,
+    io_stall_read_ms,
+    io_stall_write_ms
+FROM sys.dm_io_virtual_file_stats(NULL, NULL);
+
+3. -----------------Disk latency
+
+SELECT 
+    DB_NAME(vfs.database_id) AS DatabaseName,
+    mf.physical_name,
+    io_stall_read_ms / NULLIF(num_of_reads, 0) AS AvgReadLatency,
+    io_stall_write_ms / NULLIF(num_of_writes, 0) AS AvgWriteLatency
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
+JOIN sys.master_files mf 
+ON vfs.database_id = mf.database_id 
+AND vfs.file_id = mf.file_id;
+
+
+4. ------------ identify which query is causing the High IO
+
+
+SELECT TOP 10
+    qs.total_logical_reads,
+    qs.total_physical_reads,
+    qs.execution_count,
+    qs.total_logical_reads / qs.execution_count AS AvgReads,
+    SUBSTRING(qt.text, (qs.statement_start_offset/2)+1,
+    ((CASE qs.statement_end_offset 
+        WHEN -1 THEN DATALENGTH(qt.text)
+        ELSE qs.statement_end_offset END 
+    - qs.statement_start_offset)/2)+1) AS QueryText
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+ORDER BY qs.total_physical_reads DESC;
+
+
+5. -----check temp db uses
+
+SELECT 
+    SUM(user_object_reserved_page_count)*8 AS KB
+FROM sys.dm_db_file_space_usage;
+
+----check index uses
+
+SELECT * 
+FROM sys.dm_db_index_usage_stats;
+
+SELECT 
+    SUM(user_object_reserved_page_count)*8 AS KB_Used
+FROM sys.dm_db_file_space_usage;
+
+
+
+----------Checking Blockingh
+
+SELECT 
+    blocking_session_id, 
+    session_id, 
+    wait_type, 
+    wait_time
+FROM sys.dm_exec_requests
+WHERE blocking_session_id <> 0;
+
+
+
+-------------SQL Server Wait Stats (Top indicator)
+
+SELECT TOP 10 
+    wait_type, 
+    wait_time_ms/1000.0 AS WaitTimeSec,
+    signal_wait_time_ms/1000.0 AS SignalWaitSec
+FROM sys.dm_os_wait_stats
+WHERE wait_type LIKE 'PAGEIOLATCH%'
+ORDER BY wait_time_ms DESC;
