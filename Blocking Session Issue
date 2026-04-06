@@ -1,0 +1,312 @@
+
+ MSSQL on Windows: Blocked Session(s)
+
+Alert Description
+
+
+
+Source:  		M951DEV1\SEOPTM01
+Full Path Name:  	
+M951DEV1\SEOPTM01
+Alert Monitor:  		Blocking Sessions
+Created:  	
+5/04/2026 4:20:55 AM
+
+The following session(s) on SQL Server instance "SEOPTM01", computer "M951DEV1.ad.bcc.qld.gov.au" are blocked: 69. See the "Alert Context" tab for more details.
+
+
+
+
+Knowledge:	
+	  View additional knowledge...
+
+Summary
+The Blocking Sessions Monitor detects if a blocking situation exists. Note that this monitor is disabled by default. Use overrides to enable it when necessary.
+
+Blocking occurs when one session holds a lock on a specific resource and a second session attempts to acquire a conflicting lock type on the same resource. Blocking is an unavoidable characteristic of any relational database management system (RDBMS) with lock-based concurrency. However, too much blocking can cause performance issues.
+
+Causes
+When locking and blocking increase to the point where there is a considerable impact on system performance, it is usually due to one of the following reasons:
+
+
+
+•	
+A session holds locks on a set of resources and never releases them. Usually caused by:
+
+•	
+Cancelled queries that are not rolled back
+
+•	
+Orphaned transactions
+
+
+
+•	
+A session (identified by a session_id or “SPID”) holds locks on a set of resources for an extended period of time before releasing them. Usually caused by:
+
+•	
+Long-running transactions
+
+•	
+Lack of appropriate indexes
+
+•	
+Inappropriate use of locking hints
+
+•	
+Other issues related to poor application design
+
+Resolutions
+•	
+Kill the session at the head of the blocking chain
+
+•	
+Shorten transaction times
+
+•	
+Create proper indexes
+
+•	
+Use locking hints
+
+•	
+Use row versioning-based Isolation Levels
+
+•	
+Configure SQL Server settings (memory settings, lock timeouts, etc.)
+
+•	
+Change the thresholds on the monitor for this specific database or all databases
+
+
+
+Alternatively, if blocked sessions are not a concern for the database:
+
+•	
+Disable the monitor for this specific database or all databases
+
+Overridable Parameters
+Name
+
+Description
+
+Default Value
+
+Alert Priority
+
+Defines Alert Priority.
+
+High
+
+Alert Severity
+
+Defines Alert Severity.
+
+Error
+
+Enabled
+
+Enables or disables the workflow.
+
+No
+
+Generates Alerts
+
+Defines whether the workflow generates an Alert.
+
+Yes
+
+Interval (seconds)
+
+The recurring interval of time in seconds in which to run the workflow.
+
+300
+
+Number of blocked sessions
+
+The maximum allowed number of blocked sessions.
+
+1
+
+Synchronization Time
+
+The synchronization time specified by using a 24-hour format. May be omitted.
+
+ 
+
+Timeout (seconds)
+
+Specifies the time the workflow is allowed to run before being closed and marked as failed.
+
+200
+
+Timeout for query execution (seconds)
+
+The workflow will fail and register an event, if the query execution takes longer than the specified period.
+
+60
+
+Timeout for database connection (seconds)
+
+The workflow will fail and register an event, if it cannot access the database during the specified period.
+
+15
+
+Wait Time (minutes)
+
+The minimum process execution duration before considering it for Blocked SPIDs analysis.
+
+1
+
+
+Hide knowledge
+===================================================================================
+​
+ MSSQL on Windows: Long Running Jobs
+
+Alert Description
+
+
+
+Source:  		SQL Server Agent (SEOPTM01)
+Full Path Name:  	
+M951DEV1\SEOPTM01\SQL Server Agent (SEOPTM01)
+Alert Monitor:  		Long Running Jobs
+Created:  	
+5/04/2026 5:00:55 AM
+
+There are long running agent jobs on SQL Server instance "SEOPTM01", computer "M951DEV1.ad.bcc.qld.gov.au". This may indicate an issue with one or more jobs.
+
+
+
+
+Knowledge:	
+	  View additional knowledge...
+
+Summary
+This monitor checks for long running SQL Agent jobs. A Warning or Error alert will appear if a job has been running for longer that the configured threshold. Note that this monitor is disabled by default. Use overrides to enable it when necessary.
+
+Note that SQL Server Agent Windows Service is not supported by any edition of SQL Server Express.
+
+By default, this monitor does not monitor jobs that have schedule type 'Start automatically when SQL Server Agent starts' because these jobs often run until SQL Agent stops (i.e. continuously). Usually, SQL Server Replication uses such jobs, but in some cases, jobs with the 'Start automatically when SQL Server Agent starts' schedule type may run for a relatively short interval. To monitor these jobs, override parameter 'Included continuously executed jobs' with a comma-delimited list of the job names. The job name in the list should meet requirements of one of the following identifier classes:
+
+1) Regular:
+
+•	
+can contain any character except the comma sign (,) and double quote sign (")
+
+•	
+should not start or end with any of the white-space characters
+
+2) Delimited:
+
+•	
+can contain any characters and should be delimited by double quotes
+
+•	
+double quotes should be escaped by doubling them
+
+Any name belonging to any of the classes above should be from 1 to 128 characters, excluding delimiter characters.
+
+Causes
+An unhealthy state is caused by a SQL Server Agent job that has been running longer than the defined threshold. This could indicate a problem with the job.
+
+The SQL Server Agent is responsible for running SQL Server tasks that are scheduled at specific time periods or intervals, as well as detecting specific conditions for which administrators have defined an action, such as alerting someone through pages or email, or a task that will address the conditions. The SQL Server Agent is also used for running replication tasks defined by administrators.
+
+To identify the job that caused the warning or error state, examine the context data for the state change or alert.
+
+Resolutions
+Check SQL Server Management Studio to identify what jobs are running. If these jobs are running longer than necessary, investigate them to find out the reason.
+
+Use 'sp_help_jobactivity' to see information about the currently running jobs.
+
+Alternatively, if it is expected for some agent jobs to run for a long time:
+
+•	
+Override the monitor to change the thresholds for this specific instance of SQL or all instances
+
+•	
+Disable the monitor for this specific instance of SQL or all instances
+
+Overridable Parameters
+Name
+
+Description
+
+Default Value
+
+Alert Priority
+
+Defines Alert Priority.
+
+Normal
+
+Alert Severity
+
+Defines Alert Severity.
+
+Match monitor’s health
+
+Critical Threshold (minutes)
+
+The monitor will change its state to Critical if the value exceeds this threshold. Being between this threshold and the warning threshold (inclusive) will result in a Warning state.
+
+120
+
+Enabled
+
+Enables or disables the workflow.
+
+No
+
+Generates Alerts
+
+Defines whether the workflow generates an Alert.
+
+Yes
+
+Included continuously executed jobs
+
+Some SQL Agent Jobs may run infinitely (until Agent stops). They usually have schedule type 'Start automatically when SQL Server Agent starts'. For example, SQL Server Replication often uses such jobs. These jobs lead to false alerts and by default, the monitor does not consider them. There may be exclusions when such jobs run for a short time. In order to monitor such jobs, one shoud define a list of these jobs' names delimited by comma.
+
+ 
+
+Interval (seconds)
+
+The recurring interval of time in seconds in which to run the workflow.
+
+600
+
+Synchronization Time
+
+The synchronization time is specified by using a 24-hour format. Can be omitted.
+
+ 
+
+Timeout (seconds)
+
+Specifies the time the workflow is allowed to run before being closed and marked as failed.
+
+300
+
+Timeout for query execution (seconds)
+
+The workflow will fail and register an event, if the query execution takes longer than the specified period.
+
+60
+
+Timeout for database connection (seconds)
+
+The workflow will fail and register an event, if it cannot access the database during the specified period.
+
+15
+
+Warning Threshold (minutes)
+
+Exceeding this threshold will result in the monitor changing to at least a Warning state.
+
+60
+
+
+Hide knowledge
+
