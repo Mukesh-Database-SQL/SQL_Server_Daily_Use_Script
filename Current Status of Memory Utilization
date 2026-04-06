@@ -1,0 +1,49 @@
+---1. Memory Utilization
+SELECT 
+    physical_memory_in_use_kb / 1024 AS [SQL_Used_MB],
+    available_commit_limit_kb / 1024 AS [Available_MB],
+    CASE WHEN process_physical_memory_low = 1 THEN 'POTENTIAL PRESSURE' ELSE 'Healthy' END AS [System_Status]
+FROM sys.dm_os_process_memory;
+
+
+---2. Identify the Top Memory "Clerk"
+SELECT TOP 10
+    type AS [Memory_Clerk_Type],
+    SUM(pages_kb) / 1024 AS [Memory_Usage_MB]
+FROM sys.dm_os_memory_clerks
+GROUP BY type
+ORDER BY [Memory_Usage_MB] DESC;
+
+
+---3. Check Current "Memory-Hungry" Queries
+
+SELECT 
+    r.session_id,
+    r.status,
+    r.granted_query_memory * 8 / 1024 AS [Granted_Memory_MB],
+    t.text AS [Query_Text],
+    r.cpu_time,
+    r.logical_reads
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE r.granted_query_memory > 0
+ORDER BY [Granted_Memory_MB] DESC;
+
+---4. Check Memory Usage by Database
+
+SELECT 
+    DB_NAME(database_id) AS [Database_Name],
+    COUNT(*) * 8 / 1024 AS [Cached_Size_MB]
+FROM sys.dm_os_buffer_descriptors
+GROUP BY database_id
+ORDER BY [Cached_Size_MB] DESC;
+
+---5. Quick "Health Check" (The Status Snapshot) 
+---Value = 0: Everything is fine.
+
+----Value > 0: Queries are literally "waiting in line" for memory to become available. This is a severe bottleneck.
+
+
+SELECT cntr_value AS [Memory_Grants_Pending]
+FROM sys.dm_os_performance_counters
+WHERE counter_name = 'Memory Grants Pending';
