@@ -1,0 +1,38 @@
+A. SQL Commands to Identify Connections ----------------------
+
+SELECT 
+    s.session_id, 
+    c.net_transport, 
+    c.client_net_address, 
+    s.host_name, 
+    s.program_name
+FROM sys.dm_exec_connections AS c
+JOIN sys.dm_exec_sessions AS s 
+    ON c.session_id = s.session_id;
+
+
+B. Test Connection ------------------------
+
+Test-NetConnection -ComputerName YourServerName -Port 1433
+
+C. Identify the Listening Port and IP ----------------------------
+
+EXEC xp_readerrorlog 0, 1, N'Server is listening on';
+
+D. Endpoint status
+
+SELECT 
+    name, 
+    protocol_desc, 
+    type_desc, 
+    state_desc 
+FROM sys.endpoints
+WHERE type_desc = 'TSQL';
+
+
+E. Check remote Access ------------------------
+
+EXEC sp_configure 'remote access';
+
+
+
