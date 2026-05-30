@@ -1,0 +1,267 @@
+USE master;
+GO
+
+IF OBJECT_ID('dbo.sp_serverconfiguration', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.sp_serverconfiguration;
+GO
+
+CREATE PROCEDURE dbo.sp_serverconfiguration
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @cpu_count INT,
+            @physical_memory_gb DECIMAL(18,2),
+            @sql_memory_mb BIGINT,
+            @maxdop_recommended INT,
+            @max_server_memory_recommended INT;
+
+    SELECT
+        @cpu_count = cpu_count,
+        @physical_memory_gb =
+            CAST(physical_memory_kb / 1024.0 / 1024.0 AS DECIMAL(18,2)),
+        @sql_memory_mb =
+            committed_kb / 1024
+    FROM sys.dm_os_sys_info;
+
+    SET @maxdop_recommended =
+        CASE
+            WHEN @cpu_count <= 8 THEN @cpu_count
+            ELSE 8
+        END;
+
+    SET @max_server_memory_recommended =
+        CASE
+            WHEN @physical_memory_gb <= 4 THEN
+                CAST((@physical_memory_gb * 1024) * 0.75 AS INT)
+            ELSE
+                CAST(((@physical_memory_gb * 1024) - 4096) AS INT)
+        END;
+
+    DECLARE @results TABLE
+    (
+        Category NVARCHAR(100),
+        ConfigurationName NVARCHAR(255),
+        CurrentValue NVARCHAR(255),
+        RecommendedValue NVARCHAR(255),
+        Status NVARCHAR(50),
+        Severity NVARCHAR(50),
+        WhyImportant NVARCHAR(MAX),
+        Recommendation NVARCHAR(MAX)
+    );
+
+    -----------------------------------------------------------------
+    -- MAX SERVER MEMORY
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Memory',
+        'max server memory (MB)',
+        CAST(value_in_use AS NVARCHAR(50)),
+        CAST(@max_server_memory_recommended AS NVARCHAR(50)),
+        CASE
+            WHEN value_in_use >= (@max_server_memory_recommended * 0.90)
+                 AND value_in_use <= (@max_server_memory_recommended * 1.10)
+            THEN 'OK'
+            ELSE 'MISSING'
+        END,
+        CASE
+            WHEN value_in_use = 2147483647 THEN 'CRITICAL'
+            ELSE 'WARNING'
+        END,
+        'Prevents SQL Server from consuming all OS memory.',
+        CONCAT(
+            'Set max server memory around ',
+            @max_server_memory_recommended,
+            ' MB to reserve memory for Windows and agents.'
+        )
+    FROM sys.configurations
+    WHERE name = 'max server memory (MB)';
+
+    -----------------------------------------------------------------
+    -- COST THRESHOLD FOR PARALLELISM
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Performance',
+        'cost threshold for parallelism',
+        CAST(value_in_use AS NVARCHAR(50)),
+        '50',
+        CASE WHEN value_in_use >= 25 THEN 'OK' ELSE 'MISSING' END,
+        CASE WHEN value_in_use < 25 THEN 'WARNING' ELSE 'INFO' END,
+        'Avoids excessive parallel query plans.',
+        'Recommended baseline is 50 (adjust after workload analysis).'
+    FROM sys.configurations
+    WHERE name = 'cost threshold for parallelism';
+
+    -----------------------------------------------------------------
+    -- MAXDOP
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Performance',
+        'max degree of parallelism',
+        CAST(value_in_use AS NVARCHAR(50)),
+        CAST(@maxdop_recommended AS NVARCHAR(50)),
+        CASE
+            WHEN value_in_use = @maxdop_recommended THEN 'OK'
+            ELSE 'MISSING'
+        END,
+        CASE
+            WHEN value_in_use = 0 THEN 'WARNING'
+            ELSE 'INFO'
+        END,
+        'Controls CPU parallel execution.',
+        CONCAT(
+            'Recommended MAXDOP: ',
+            @maxdop_recommended,
+            ' based on CPU count.'
+        )
+    FROM sys.configurations
+    WHERE name = 'max degree of parallelism';
+
+    -----------------------------------------------------------------
+    -- OPTIMIZE FOR AD HOC WORKLOADS
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Performance',
+        'optimize for ad hoc workloads',
+        CAST(value_in_use AS NVARCHAR(50)),
+        '1',
+        CASE WHEN value_in_use = 1 THEN 'OK' ELSE 'MISSING' END,
+        CASE WHEN value_in_use = 0 THEN 'WARNING' ELSE 'INFO' END,
+        'Reduces plan cache bloat from single-use queries.',
+        'Enable this for OLTP or mixed workloads.'
+    FROM sys.configurations
+    WHERE name = 'optimize for ad hoc workloads';
+
+    -----------------------------------------------------------------
+    -- BACKUP COMPRESSION
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Backup',
+        'backup compression default',
+        CAST(value_in_use AS NVARCHAR(50)),
+        '1',
+        CASE WHEN value_in_use = 1 THEN 'OK' ELSE 'MISSING' END,
+        'INFO',
+        'Reduces backup size and duration.',
+        'Enable backup compression unless CPU constrained.'
+    FROM sys.configurations
+    WHERE name = 'backup compression default';
+
+    -----------------------------------------------------------------
+    -- REMOTE ADMIN CONNECTIONS
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Administration',
+        'remote admin connections',
+        CAST(value_in_use AS NVARCHAR(50)),
+        '1',
+        CASE WHEN value_in_use = 1 THEN 'OK' ELSE 'MISSING' END,
+        'INFO',
+        'Allows DAC for emergency troubleshooting.',
+        'Enable dedicated admin connection.'
+    FROM sys.configurations
+    WHERE name = 'remote admin connections';
+
+    -----------------------------------------------------------------
+    -- CLR
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Security',
+        'clr enabled',
+        CAST(value_in_use AS NVARCHAR(50)),
+        '0 (unless needed)',
+        CASE WHEN value_in_use = 0 THEN 'OK' ELSE 'REVIEW' END,
+        'INFO',
+        'CLR increases attack surface if unused.',
+        'Disable unless application explicitly requires CLR.'
+    FROM sys.configurations
+    WHERE name = 'clr enabled';
+
+    -----------------------------------------------------------------
+    -- XP_CMDSHELL
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Security',
+        'xp_cmdshell',
+        CAST(value_in_use AS NVARCHAR(50)),
+        '0',
+        CASE WHEN value_in_use = 0 THEN 'OK' ELSE 'MISSING' END,
+        CASE WHEN value_in_use = 1 THEN 'CRITICAL' ELSE 'INFO' END,
+        'Can execute OS commands and increases attack surface.',
+        'Disable xp_cmdshell unless absolutely required.'
+    FROM sys.configurations
+    WHERE name = 'xp_cmdshell';
+
+    -----------------------------------------------------------------
+    -- DATABASE MAIL
+    -----------------------------------------------------------------
+    INSERT INTO @results
+    SELECT
+        'Administration',
+        'Database Mail XPs',
+        CAST(value_in_use AS NVARCHAR(50)),
+        '1',
+        CASE WHEN value_in_use = 1 THEN 'OK' ELSE 'REVIEW' END,
+        'INFO',
+        'Supports alerting and SQL Agent notifications.',
+        'Enable for monitoring and DBA alerts.'
+    FROM sys.configurations
+    WHERE name = 'Database Mail XPs';
+
+    -----------------------------------------------------------------
+    -- SERVER INFO
+    -----------------------------------------------------------------
+    SELECT
+        @@SERVERNAME AS ServerName,
+        SERVERPROPERTY('MachineName') AS MachineName,
+        SERVERPROPERTY('Edition') AS Edition,
+        SERVERPROPERTY('ProductVersion') AS ProductVersion,
+        SERVERPROPERTY('ProductLevel') AS ProductLevel,
+        SERVERPROPERTY('EngineEdition') AS EngineEdition,
+        @cpu_count AS CPUCount,
+        @physical_memory_gb AS PhysicalMemoryGB,
+        @sql_memory_mb AS SQLMemoryMB,
+        GETDATE() AS AssessmentDate;
+
+    -----------------------------------------------------------------
+    -- CONFIGURATION HEALTH REPORT
+    -----------------------------------------------------------------
+    SELECT
+        Category,
+        ConfigurationName,
+        CurrentValue,
+        RecommendedValue,
+        Status,
+        Severity,
+        WhyImportant,
+        Recommendation,
+        CASE
+            WHEN Status = 'MISSING'
+                THEN '⚠️ REVIEW REQUIRED'
+            WHEN Severity = 'CRITICAL'
+                THEN '🚨 HIGH PRIORITY'
+            ELSE '✅ HEALTHY'
+        END AS Highlight
+    FROM @results
+    ORDER BY
+        CASE Severity
+            WHEN 'CRITICAL' THEN 1
+            WHEN 'WARNING' THEN 2
+            ELSE 3
+        END,
+        Category,
+        ConfigurationName;
+
+END;
+GO
+
+EXEC dbo.sp_serverconfiguration;
+GO
