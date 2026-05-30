@@ -1,0 +1,1195 @@
+/*
+========================================================================
+  sp_serverconfiguration - SQL Server Configuration Health & Advisory
+  Author   : DBA Toolkit
+  Version  : 1.0
+  Created  : 2026
+  Purpose  : Comprehensive SQL Server configuration audit with:
+             - Current vs Recommended values for every key setting
+             - Missing / misconfigured settings highlighted
+             - Actionable fix scripts (copy-paste ready)
+             - Severity rating: CRITICAL / WARNING / INFO / OK
+             - Categorised sections for easy navigation
+
+========================================================================
+  OUTPUT SECTIONS:
+    [1]  Server Info Summary         – Version, edition, uptime, hardware
+    [2]  Memory Configuration        – Max/Min memory, LPIM, AWE, PLE
+    [3]  CPU & Parallelism           – MAXDOP, CTFP, scheduler affinity
+    [4]  Security Settings           – xp_cmdshell, CLR, SA account etc.
+    [5]  I/O & Storage Settings      – IFI, TempDB file count, growth
+    [6]  Backup & Recovery           – Backup compression, checksum, VDI
+    [7]  Network & Connections       – Max connections, remote access, SNI
+    [8]  Query & Plan Cache          – Optimize for ad hoc, plan guides
+    [9]  Database Mail & Alerts      – Mail, operator, sysadmin alerts
+    [10] Full Configuration Audit    – All sp_configure settings vs best practice
+    [11] Database-Level Checks       – Auto-close, auto-shrink, compat level
+    [12] TempDB Best Practices       – File count, equal sizing, placement
+    [13] Trace Flags                 – Active trace flags analysis
+    [14] Missing Configuration Summary – Consolidated list of gaps
+
+========================================================================
+  USAGE:
+    EXEC sp_serverconfiguration                         -- full audit
+    EXEC sp_serverconfiguration @Section = 'MEMORY'     -- single section
+    EXEC sp_serverconfiguration @ShowOKItems = 0        -- issues only
+    EXEC sp_serverconfiguration @GenerateFixScript = 1  -- print fix T-SQL
+========================================================================
+*/
+
+USE master;
+GO
+
+IF OBJECT_ID('dbo.sp_serverconfiguration', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.sp_serverconfiguration;
+GO
+
+CREATE PROCEDURE dbo.sp_serverconfiguration
+    @Section           NVARCHAR(50)  = 'ALL',   -- ALL | MEMORY | CPU | SECURITY | IO |
+                                                --  BACKUP | NETWORK | QUERY | MAIL |
+                                                --  CONFIG | DATABASE | TEMPDB | TRACEFLAGS | SUMMARY
+    @ShowOKItems       BIT           = 1,       -- 0 = show only warnings/critical
+    @GenerateFixScript BIT           = 1,       -- 1 = emit RECONFIGURE scripts
+    @Debug             BIT           = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    /* ============================================================
+       DECLARATIONS
+    ============================================================ */
+    DECLARE @NowUTC          DATETIME2   = SYSUTCDATETIME();
+    DECLARE @ServerName      NVARCHAR(128) = @@SERVERNAME;
+    DECLARE @SQLVersion      NVARCHAR(256) = @@VERSION;
+    DECLARE @Edition         NVARCHAR(128) = CAST(SERVERPROPERTY('Edition')       AS NVARCHAR(128));
+    DECLARE @ProductVersion  NVARCHAR(30)  = CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(30));
+    DECLARE @ProductLevel    NVARCHAR(30)  = CAST(SERVERPROPERTY('ProductLevel')   AS NVARCHAR(30));
+    DECLARE @ProductUpdate   NVARCHAR(30)  = CAST(SERVERPROPERTY('ProductUpdateLevel') AS NVARCHAR(30));
+    DECLARE @IsHadrEnabled   INT          = CAST(SERVERPROPERTY('IsHadrEnabled')   AS INT);
+    DECLARE @IsClustered     INT          = CAST(SERVERPROPERTY('IsClustered')     AS INT);
+    DECLARE @TotalRAM_MB     BIGINT;
+    DECLARE @LogicalCPUs     INT;
+    DECLARE @NUMANodes       INT;
+    DECLARE @Uptime          NVARCHAR(100);
+    DECLARE @MajorVersion    INT          = CAST(LEFT(@ProductVersion,
+                                               CHARINDEX('.', @ProductVersion) - 1) AS INT);
+    DECLARE @FixScript       NVARCHAR(MAX) = N'';
+
+    SELECT @TotalRAM_MB  = physical_memory_kb / 1024,
+           @LogicalCPUs  = cpu_count
+    FROM sys.dm_os_sys_info;
+
+    SELECT @NUMANodes = COUNT(DISTINCT parent_node_id)
+    FROM sys.dm_os_schedulers
+    WHERE status = 'VISIBLE ONLINE';
+
+    SELECT @Uptime =
+        CONVERT(NVARCHAR(10), DATEDIFF(DAY,  sqlserver_start_time, GETDATE())) + ' days, ' +
+        CONVERT(NVARCHAR(10), DATEDIFF(HOUR, sqlserver_start_time, GETDATE()) % 24) + ' hrs, ' +
+        CONVERT(NVARCHAR(10), DATEDIFF(MINUTE,sqlserver_start_time,GETDATE()) % 60) + ' mins'
+    FROM sys.dm_os_sys_info;
+
+    SET @Section = UPPER(LTRIM(RTRIM(@Section)));
+
+    /* ============================================================
+       STAGING TABLE  – all findings accumulate here
+    ============================================================ */
+    IF OBJECT_ID('tempdb..#ConfigAudit') IS NOT NULL DROP TABLE #ConfigAudit;
+    CREATE TABLE #ConfigAudit (
+        AuditID          INT IDENTITY(1,1),
+        Section          NVARCHAR(50),
+        Category         NVARCHAR(80),
+        SettingName      NVARCHAR(150),
+        CurrentValue     NVARCHAR(200),
+        RecommendedValue NVARCHAR(200),
+        Status           NVARCHAR(20),    -- OK | INFO | WARNING | CRITICAL | MISSING
+        Impact           NVARCHAR(500),
+        FixScript        NVARCHAR(1000),
+        Reference        NVARCHAR(200)
+    );
+
+    /* ============================================================
+       HELPER: read sp_configure into a temp table once
+    ============================================================ */
+    IF OBJECT_ID('tempdb..#SrvConfig') IS NOT NULL DROP TABLE #SrvConfig;
+    CREATE TABLE #SrvConfig (
+        name         NVARCHAR(100),
+        minimum      BIGINT,
+        maximum      BIGINT,
+        config_value BIGINT,
+        run_value    BIGINT
+    );
+    INSERT INTO #SrvConfig
+    SELECT name,
+       CAST(CAST(minimum      AS NVARCHAR(50)) AS BIGINT),
+       CAST(CAST(maximum      AS NVARCHAR(50)) AS BIGINT),
+       CAST(CAST(value        AS NVARCHAR(50)) AS BIGINT),
+       CAST(CAST(value_in_use AS NVARCHAR(50)) AS BIGINT)
+FROM sys.configurations;
+
+    IF @Debug = 1 PRINT 'sp_serverconfiguration: starting audit on ' + @ServerName;
+
+    /* ============================================================
+       [1] SERVER INFO SUMMARY
+    ============================================================ */
+    IF @Section IN ('ALL','INFO')
+    BEGIN
+        IF @Debug = 1 PRINT '[1] Server Info...';
+
+        -- Always show; no status needed, purely informational
+        INSERT INTO #ConfigAudit
+            (Section, Category, SettingName, CurrentValue, RecommendedValue,
+             Status, Impact, FixScript, Reference)
+        VALUES
+        ('Server Info','Identity','Server Name',        @ServerName,                    'N/A','INFO','Identify the target server.','',''),
+        ('Server Info','Identity','SQL Version',        @ProductVersion,                'Latest SP/CU','INFO','Running outdated builds exposes you to known bugs and security CVEs.',
+            'Check: https://sqlserverbuilds.blogspot.com','https://aka.ms/sqlbuilds'),
+        ('Server Info','Identity','Edition',            @Edition,                       'Enterprise (prod) / Developer (dev)','INFO','Edition governs available features.','',''),
+        ('Server Info','Identity','Product Level',      @ProductLevel + ' / ' + ISNULL(@ProductUpdate,''),  'Latest CU','INFO','','',''),
+        ('Server Info','Identity','Is Clustered',       CASE @IsClustered WHEN 1 THEN 'YES' ELSE 'NO' END,  'N/A','INFO','','',''),
+        ('Server Info','Identity','Is HADR Enabled',    CASE @IsHadrEnabled WHEN 1 THEN 'YES' ELSE 'NO' END,'N/A','INFO','','',''),
+        ('Server Info','Hardware','Total RAM (MB)',      CAST(@TotalRAM_MB AS NVARCHAR), 'N/A','INFO','','',''),
+        ('Server Info','Hardware','Logical CPUs',       CAST(@LogicalCPUs AS NVARCHAR),  'N/A','INFO','','',''),
+        ('Server Info','Hardware','NUMA Nodes',         CAST(@NUMANodes AS NVARCHAR),    'N/A','INFO','','',''),
+        ('Server Info','Hardware','Server Uptime',      @Uptime,                         'N/A','INFO','','','');
+    END
+
+
+    /* ============================================================
+       [2] MEMORY CONFIGURATION
+    ============================================================ */
+    IF @Section IN ('ALL','MEMORY')
+    BEGIN
+        IF @Debug = 1 PRINT '[2] Memory Configuration...';
+
+        DECLARE @MaxMem       BIGINT, @MinMem BIGINT;
+        DECLARE @RecommMaxMem BIGINT;
+        DECLARE @PLE          BIGINT;
+
+        SELECT @MaxMem = run_value FROM #SrvConfig WHERE name = 'max server memory (MB)';
+        SELECT @MinMem = run_value FROM #SrvConfig WHERE name = 'min server memory (MB)';
+        SELECT @PLE = cntr_value
+        FROM sys.dm_os_performance_counters
+        WHERE counter_name = 'Page life expectancy'
+          AND object_name LIKE '%Buffer Manager%';
+
+        -- Recommended max memory = Total RAM - OS reserve
+        -- Rule: leave 10% or at least 4 GB for OS
+        SET @RecommMaxMem = @TotalRAM_MB -
+            CASE
+                WHEN @TotalRAM_MB <= 4096  THEN 1024
+                WHEN @TotalRAM_MB <= 8192  THEN 2048
+                WHEN @TotalRAM_MB <= 16384 THEN 3072
+                WHEN @TotalRAM_MB <= 32768 THEN 4096
+                ELSE @TotalRAM_MB / 10
+            END;
+
+        /* Max Server Memory */
+        INSERT INTO #ConfigAudit
+        SELECT 'Memory','Max Server Memory','max server memory (MB)',
+            CAST(@MaxMem AS NVARCHAR),
+            CAST(@RecommMaxMem AS NVARCHAR) + ' MB (approx)',
+            CASE WHEN @MaxMem = 2147483647 THEN 'CRITICAL'
+                 WHEN @MaxMem > @RecommMaxMem + 2048 THEN 'WARNING'
+                 ELSE 'OK' END,
+            CASE WHEN @MaxMem = 2147483647
+                 THEN 'Max memory is at DEFAULT (2147483647 MB). SQL Server can consume all OS memory, causing OS paging and instability.'
+                 WHEN @MaxMem > @RecommMaxMem + 2048
+                 THEN 'Max memory may be set too high, leaving insufficient RAM for the OS.'
+                 ELSE 'Max server memory is configured appropriately.' END,
+            CASE WHEN @MaxMem = 2147483647 OR @MaxMem > @RecommMaxMem + 2048
+                 THEN 'EXEC sp_configure ''max server memory (MB)'', ' + CAST(@RecommMaxMem AS NVARCHAR) + '; RECONFIGURE WITH OVERRIDE;'
+                 ELSE '' END,
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/server-memory-server-configuration-options';
+
+        /* Min Server Memory */
+        INSERT INTO #ConfigAudit
+        SELECT 'Memory','Min Server Memory','min server memory (MB)',
+            CAST(@MinMem AS NVARCHAR),
+            '0 (default OK; dedicated server: set to 80% of max)',
+            CASE WHEN @MinMem = 0 THEN 'INFO' ELSE 'OK' END,
+            'Setting min memory prevents SQL Server from releasing buffer pool during low-usage periods on a dedicated server.',
+            '',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/server-memory-server-configuration-options';
+
+        /* Page Life Expectancy */
+        INSERT INTO #ConfigAudit
+        SELECT 'Memory','Buffer Pool','Page Life Expectancy (PLE)',
+            CAST(ISNULL(@PLE,0) AS NVARCHAR) + ' seconds',
+            '> 300 s (ideally > 1000 s)',
+            CASE WHEN @PLE IS NULL THEN 'MISSING'
+                 WHEN @PLE < 300  THEN 'CRITICAL'
+                 WHEN @PLE < 1000 THEN 'WARNING'
+                 ELSE 'OK' END,
+            CASE WHEN ISNULL(@PLE,0) < 300
+                 THEN 'Low PLE indicates memory pressure. Pages are being evicted from buffer pool too quickly, causing excessive disk reads.'
+                 ELSE 'PLE is healthy.' END,
+            CASE WHEN ISNULL(@PLE,0) < 300
+                 THEN '-- Investigate: high-cost queries, insufficient max server memory, memory-hungry clerks.'
+                 ELSE '' END,
+            'https://docs.microsoft.com/sql/relational-databases/performance-monitor/sql-server-buffer-manager-object';
+
+        /* Lock Pages In Memory */
+        DECLARE @LPIM BIT = 0;
+        -- LPIM detection via locked_page_allocations_kb
+        SELECT @LPIM = CASE WHEN locked_page_allocations_kb > 0 THEN 1 ELSE 0 END
+        FROM sys.dm_os_process_memory;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Memory','OS Integration','Lock Pages In Memory (LPIM)',
+            CASE @LPIM WHEN 1 THEN 'ENABLED' ELSE 'NOT DETECTED' END,
+            'ENABLED on high-memory servers (Enterprise Ed.)',
+            CASE WHEN @LPIM = 0 AND @TotalRAM_MB > 32768 THEN 'INFO'
+                 ELSE 'OK' END,
+            'LPIM prevents the OS from paging SQL Server buffer pool pages to disk under memory pressure. Recommended on large servers.',
+            'Grant ''Lock Pages in Memory'' privilege to the SQL Server service account in Local Security Policy (secpol.msc) → User Rights Assignment.',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/enable-the-lock-pages-in-memory-option-windows';
+
+        /* Memory-Optimized (In-Memory OLTP) */
+        IF @MajorVersion >= 12  -- SQL 2014+
+        BEGIN
+            DECLARE @XTPEnabled INT = 0;
+            SELECT @XTPEnabled = COUNT(*)
+            FROM sys.databases
+            WHERE is_memory_optimized_elevate_to_snapshot_on = 1;
+
+            INSERT INTO #ConfigAudit
+            SELECT 'Memory','In-Memory OLTP','In-Memory OLTP Databases',
+                CAST(@XTPEnabled AS NVARCHAR) + ' database(s)',
+                'N/A – informational',
+                'INFO',
+                'In-Memory OLTP (Hekaton) can dramatically improve OLTP throughput. Evaluate for high-contention tables.',
+                '',
+                'https://docs.microsoft.com/sql/relational-databases/in-memory-oltp/overview-and-usage-scenarios';
+        END
+    END -- [2] Memory
+
+
+    /* ============================================================
+       [3] CPU & PARALLELISM
+    ============================================================ */
+    IF @Section IN ('ALL','CPU')
+    BEGIN
+        IF @Debug = 1 PRINT '[3] CPU & Parallelism...';
+
+        DECLARE @MAXDOP    BIGINT, @CTFP BIGINT, @LightPool BIGINT, @PriorityBoost BIGINT;
+        SELECT @MAXDOP       = run_value FROM #SrvConfig WHERE name = 'max degree of parallelism';
+        SELECT @CTFP         = run_value FROM #SrvConfig WHERE name = 'cost threshold for parallelism';
+        SELECT @LightPool    = run_value FROM #SrvConfig WHERE name = 'lightweight pooling';
+        SELECT @PriorityBoost= run_value FROM #SrvConfig WHERE name = 'priority boost';
+
+        /* MAXDOP recommendation */
+        DECLARE @RecommMAXDOP INT;
+        SET @RecommMAXDOP =
+            CASE
+                WHEN @LogicalCPUs <= 8  THEN @LogicalCPUs
+                WHEN @NUMANodes   = 1   THEN 8
+                ELSE                        -- multi-NUMA: half of CPUs per NUMA, max 16
+                    CASE WHEN (@LogicalCPUs / @NUMANodes) > 16 THEN 16
+                         ELSE (@LogicalCPUs / @NUMANodes) END
+            END;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'CPU & Parallelism','Parallelism','max degree of parallelism (MAXDOP)',
+            CAST(@MAXDOP AS NVARCHAR),
+            'Recommended: ' + CAST(@RecommMAXDOP AS NVARCHAR),
+            CASE WHEN @MAXDOP = 0 THEN 'WARNING'
+                 WHEN @MAXDOP = @RecommMAXDOP THEN 'OK'
+                 WHEN ABS(@MAXDOP - @RecommMAXDOP) <= 2 THEN 'INFO'
+                 ELSE 'WARNING' END,
+            CASE WHEN @MAXDOP = 0
+                 THEN 'MAXDOP = 0 means unlimited parallelism. Queries can consume all CPUs, starving other sessions. For OLTP workloads, limit MAXDOP.'
+                 ELSE 'MAXDOP controls how many CPUs a single query can use. Tune per workload type (OLTP vs DWH).' END,
+            'EXEC sp_configure ''max degree of parallelism'', ' + CAST(@RecommMAXDOP AS NVARCHAR) + '; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/configure-the-max-degree-of-parallelism-server-configuration-option';
+
+        /* Cost Threshold for Parallelism */
+        INSERT INTO #ConfigAudit
+        SELECT 'CPU & Parallelism','Parallelism','cost threshold for parallelism',
+            CAST(@CTFP AS NVARCHAR),
+            '50 (default 5 is too low)',
+            CASE WHEN @CTFP <= 5 THEN 'WARNING'
+                 WHEN @CTFP < 25 THEN 'INFO'
+                 ELSE 'OK' END,
+            'Default value of 5 causes too many trivial queries to go parallel. Raising to 50 (or higher for DWH) reduces scheduler contention.',
+            'EXEC sp_configure ''cost threshold for parallelism'', 50; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/configure-the-cost-threshold-for-parallelism-server-configuration-option';
+
+        /* Lightweight Pooling (Fiber Mode) */
+        INSERT INTO #ConfigAudit
+        SELECT 'CPU & Parallelism','Fiber Mode','lightweight pooling (fiber mode)',
+            CAST(@LightPool AS NVARCHAR),
+            '0 (disabled)',
+            CASE WHEN @LightPool = 1 THEN 'CRITICAL' ELSE 'OK' END,
+            'Fiber mode is NOT recommended. It can cause deadlocks with certain APIs and is largely obsolete since SQL 2000. Should be disabled.',
+            'EXEC sp_configure ''lightweight pooling'', 0; RECONFIGURE WITH OVERRIDE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/lightweight-pooling-server-configuration-option';
+
+        /* Priority Boost */
+        INSERT INTO #ConfigAudit
+        SELECT 'CPU & Parallelism','OS Scheduling','priority boost',
+            CAST(@PriorityBoost AS NVARCHAR),
+            '0 (disabled)',
+            CASE WHEN @PriorityBoost = 1 THEN 'CRITICAL' ELSE 'OK' END,
+            'Priority Boost raises SQL Server process to REALTIME priority. This can starve the OS scheduler, causing system instability. Microsoft recommends leaving this OFF.',
+            'EXEC sp_configure ''priority boost'', 0; RECONFIGURE WITH OVERRIDE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/priority-boost-server-configuration-option';
+
+        /* Optimize for Ad Hoc Workloads */
+        DECLARE @AdHoc BIGINT;
+        SELECT @AdHoc = run_value FROM #SrvConfig WHERE name = 'optimize for ad hoc workloads';
+        INSERT INTO #ConfigAudit
+        SELECT 'CPU & Parallelism','Plan Cache','optimize for ad hoc workloads',
+            CASE @AdHoc WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END,
+            'ENABLED',
+            CASE WHEN @AdHoc = 0 THEN 'WARNING' ELSE 'OK' END,
+            'When disabled, single-use ad hoc query plans bloat the plan cache, wasting memory. Enable this on every OLTP server.',
+            'EXEC sp_configure ''optimize for ad hoc workloads'', 1; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/optimize-for-ad-hoc-workloads-server-configuration-option';
+
+    END -- [3] CPU
+
+
+    /* ============================================================
+       [4] SECURITY SETTINGS
+    ============================================================ */
+    IF @Section IN ('ALL','SECURITY')
+    BEGIN
+        IF @Debug = 1 PRINT '[4] Security Settings...';
+
+        DECLARE @XPCmd BIGINT, @CLR BIGINT, @RemoteAccess BIGINT, @RemoteAdmin BIGINT;
+        DECLARE @CrossDB BIGINT, @OleAuto BIGINT;
+        SELECT @XPCmd        = run_value FROM #SrvConfig WHERE name = 'xp_cmdshell';
+        SELECT @CLR          = run_value FROM #SrvConfig WHERE name = 'clr enabled';
+        SELECT @RemoteAccess = run_value FROM #SrvConfig WHERE name = 'remote access';
+        SELECT @RemoteAdmin  = run_value FROM #SrvConfig WHERE name = 'remote admin connections';
+        SELECT @CrossDB      = run_value FROM #SrvConfig WHERE name = 'cross db ownership chaining';
+        SELECT @OleAuto      = run_value FROM #SrvConfig WHERE name = 'Ole Automation Procedures';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Security','Surface Area','xp_cmdshell',
+            CASE @XPCmd WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END, 'DISABLED',
+            CASE @XPCmd WHEN 1 THEN 'CRITICAL' ELSE 'OK' END,
+            'xp_cmdshell allows execution of OS commands from T-SQL. This is a significant attack surface. Disable unless absolutely required.',
+            'EXEC sp_configure ''xp_cmdshell'', 0; RECONFIGURE WITH OVERRIDE;',
+            'https://docs.microsoft.com/sql/relational-databases/system-stored-procedures/xp-cmdshell-transact-sql';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Security','Surface Area','clr enabled',
+            CASE @CLR WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END, 'DISABLED unless required',
+            CASE @CLR WHEN 1 THEN 'INFO' ELSE 'OK' END,
+            'CLR integration allows .NET code to run inside SQL Server. Disable if no CLR assemblies are deployed.',
+            'EXEC sp_configure ''clr enabled'', 0; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/relational-databases/clr-integration/clr-integration-enabling';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Security','Surface Area','Ole Automation Procedures',
+            CASE @OleAuto WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END, 'DISABLED',
+            CASE @OleAuto WHEN 1 THEN 'WARNING' ELSE 'OK' END,
+            'OLE Automation allows COM object creation inside T-SQL. High attack surface, rarely needed. Disable.',
+            'EXEC sp_configure ''Ole Automation Procedures'', 0; RECONFIGURE WITH OVERRIDE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/ole-automation-procedures-server-configuration-option';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Security','Surface Area','cross db ownership chaining',
+            CASE @CrossDB WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END, 'DISABLED',
+            CASE @CrossDB WHEN 1 THEN 'WARNING' ELSE 'OK' END,
+            'Cross-database chaining allows ownership chains to span databases. This can bypass security boundaries. Disable at server level; enable per-database only if required.',
+            'EXEC sp_configure ''cross db ownership chaining'', 0; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/cross-db-ownership-chaining-server-configuration-option';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Security','Remote Access','remote admin connections (DAC)',
+            CASE @RemoteAdmin WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END, 'ENABLED (prod servers)',
+            CASE WHEN @RemoteAdmin = 0 THEN 'INFO' ELSE 'OK' END,
+            'The Dedicated Administrator Connection (DAC) allows remote emergency access when SQL Server is unresponsive. Enable on production servers.',
+            'EXEC sp_configure ''remote admin connections'', 1; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/remote-admin-connections-server-configuration-option';
+
+        /* SA Account */
+        DECLARE @SADisabled INT;
+        SELECT @SADisabled = is_disabled FROM sys.server_principals WHERE name = 'sa';
+        INSERT INTO #ConfigAudit
+        SELECT 'Security','Logins','SA Account Status',
+            CASE ISNULL(@SADisabled,1) WHEN 1 THEN 'DISABLED (Good)' ELSE 'ENABLED' END,
+            'DISABLED (rename + disable)',
+            CASE ISNULL(@SADisabled,1) WHEN 0 THEN 'CRITICAL' ELSE 'OK' END,
+            'The ''sa'' account is a well-known target. It should be disabled and renamed. If SQL authentication is required, use a non-default admin login name.',
+            'ALTER LOGIN [sa] DISABLE; ALTER LOGIN [sa] WITH NAME = [sql_admin];',
+            'https://docs.microsoft.com/sql/relational-databases/security/choose-an-authentication-mode';
+
+        /* Mixed Mode Authentication */
+        DECLARE @AuthMode INT;
+        SET @AuthMode = CAST(SERVERPROPERTY('IsIntegratedSecurityOnly') AS INT);
+        INSERT INTO #ConfigAudit
+        SELECT 'Security','Authentication','Authentication Mode',
+            CASE @AuthMode WHEN 1 THEN 'Windows Only' ELSE 'Mixed (SQL + Windows)' END,
+            'Windows Authentication Only',
+            CASE @AuthMode WHEN 0 THEN 'WARNING' ELSE 'OK' END,
+            'Mixed mode authentication allows SQL logins which are weaker (password-based). Prefer Windows Authentication. If SQL logins are required, enforce strong password policies.',
+            '-- Change requires registry edit + service restart. Use SQL Server Configuration Manager.',
+            'https://docs.microsoft.com/sql/relational-databases/security/choose-an-authentication-mode';
+
+        /* Sysadmin count */
+        DECLARE @SysadminCount INT;
+        SELECT @SysadminCount = COUNT(*)
+        FROM sys.server_role_members srm
+        INNER JOIN sys.server_principals sp ON sp.principal_id = srm.member_principal_id
+        INNER JOIN sys.server_principals sr ON sr.principal_id = srm.role_principal_id
+        WHERE sr.name = 'sysadmin'
+          AND sp.is_disabled = 0
+          AND sp.name NOT IN ('sa');
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Security','Privilege','Active Sysadmin Logins (excl. SA)',
+            CAST(@SysadminCount AS NVARCHAR) + ' login(s)',
+            'Minimum required (< 5)',
+            CASE WHEN @SysadminCount > 10 THEN 'CRITICAL'
+                 WHEN @SysadminCount > 5  THEN 'WARNING'
+                 ELSE 'OK' END,
+            'Excessive sysadmin accounts increase the blast radius of a compromised credential. Review and reduce to minimum required.',
+            'SELECT name, type_desc, is_disabled FROM sys.server_principals sp JOIN sys.server_role_members srm ON sp.principal_id = srm.member_principal_id JOIN sys.server_principals sr ON sr.principal_id = srm.role_principal_id WHERE sr.name = ''sysadmin'';',
+            'https://docs.microsoft.com/sql/relational-databases/security/authentication-access/server-level-roles';
+
+    END -- [4] Security
+
+
+    /* ============================================================
+       [5] I/O & STORAGE SETTINGS
+    ============================================================ */
+    IF @Section IN ('ALL','IO')
+    BEGIN
+        IF @Debug = 1 PRINT '[5] I/O & Storage...';
+
+        /* Backup Compression */
+        DECLARE @BackupCompression BIGINT;
+        SELECT @BackupCompression = run_value FROM #SrvConfig WHERE name = 'backup compression default';
+        INSERT INTO #ConfigAudit
+        SELECT 'I/O & Storage','Backup','backup compression default',
+            CASE @BackupCompression WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END,
+            'ENABLED',
+            CASE @BackupCompression WHEN 0 THEN 'WARNING' ELSE 'OK' END,
+            'Backup compression reduces backup file size (typically 40-70%) and speeds up backup I/O. Enable by default on all editions that support it (Standard/Enterprise SQL 2008+).',
+            'EXEC sp_configure ''backup compression default'', 1; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/relational-databases/backup-restore/backup-compression-sql-server';
+
+        /* Page Verify */
+        DECLARE @PageVerifyCount INT;
+        SELECT @PageVerifyCount = COUNT(*)
+        FROM sys.databases
+        WHERE page_verify_option_desc <> 'CHECKSUM'
+          AND database_id > 2;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'I/O & Storage','Data Integrity','PAGE_VERIFY = CHECKSUM (non-system DBs)',
+            CAST(@PageVerifyCount AS NVARCHAR) + ' database(s) NOT using CHECKSUM',
+            'All databases: PAGE_VERIFY = CHECKSUM',
+            CASE WHEN @PageVerifyCount > 0 THEN 'WARNING' ELSE 'OK' END,
+            'CHECKSUM page verification detects I/O corruption. TORN_PAGE_DETECTION and NONE provide weaker or no protection.',
+            '-- Run for each affected DB:' + CHAR(13) +
+            'SELECT ''ALTER DATABASE ['' + name + ''] SET PAGE_VERIFY CHECKSUM;'' FROM sys.databases WHERE page_verify_option_desc <> ''CHECKSUM'' AND database_id > 2;',
+            'https://docs.microsoft.com/sql/relational-databases/policy-based-management/set-the-page-verify-database-option-to-checksum';
+
+        /* Auto-Growth set to percentage */
+        DECLARE @PctGrowthCount INT;
+        SELECT @PctGrowthCount = COUNT(*)
+        FROM sys.master_files
+        WHERE is_percent_growth = 1
+          AND database_id > 2;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'I/O & Storage','File Growth','Auto-Growth set to PERCENTAGE',
+            CAST(@PctGrowthCount AS NVARCHAR) + ' file(s) with % growth',
+            '0 files – use fixed MB growth instead',
+            CASE WHEN @PctGrowthCount > 0 THEN 'WARNING' ELSE 'OK' END,
+            'Percentage-based auto-growth produces unpredictably large growth events as files get bigger, causing long I/O stalls. Use fixed-size increments (e.g. 256 MB for data, 64 MB for log).',
+            '-- Query to identify and fix:' + CHAR(13) +
+            'SELECT DB_NAME(database_id), name, physical_name, growth, is_percent_growth FROM sys.master_files WHERE is_percent_growth = 1 AND database_id > 2;',
+            'https://docs.microsoft.com/sql/relational-databases/databases/manage-the-size-of-the-transaction-log-file';
+
+        /* Instant File Initialization (IFI) – inferred */
+        DECLARE @IFIEnabled BIT = 0;
+        -- SQL 2014 SP2+ exposes IFI via sys.dm_server_services indirectly;
+        -- Best proxy: try a known DMF available in 2016+
+        IF @MajorVersion >= 13
+        BEGIN
+            BEGIN TRY
+                DECLARE @IFIResult TABLE (instant_file_initialization_enabled NVARCHAR(1));
+                INSERT INTO @IFIResult
+                EXEC ('SELECT instant_file_initialization_enabled FROM sys.dm_server_services WHERE servicename LIKE ''SQL Server (%''');
+                SELECT TOP 1 @IFIEnabled = CASE instant_file_initialization_enabled WHEN 'Y' THEN 1 ELSE 0 END FROM @IFIResult;
+            END TRY
+            BEGIN CATCH
+                SET @IFIEnabled = 0;
+            END CATCH
+        END
+
+        INSERT INTO #ConfigAudit
+        SELECT 'I/O & Storage','IFI','Instant File Initialization (IFI)',
+            CASE @IFIEnabled WHEN 1 THEN 'ENABLED' ELSE 'DISABLED or UNKNOWN' END,
+            'ENABLED',
+            CASE @IFIEnabled WHEN 0 THEN 'WARNING' ELSE 'OK' END,
+            'IFI allows SQL Server to skip zeroing of data file allocations, dramatically speeding up database creation, auto-growth events, and restore operations. Does NOT apply to log files (security by design).',
+            'Grant ''Perform Volume Maintenance Tasks'' (SE_MANAGE_VOLUME_NAME) to the SQL Server service account in Local Security Policy → User Rights Assignment. Restart SQL Server service.',
+            'https://docs.microsoft.com/sql/relational-databases/databases/database-instant-file-initialization';
+
+    END -- [5] I/O
+
+
+    /* ============================================================
+       [6] BACKUP & RECOVERY
+    ============================================================ */
+    IF @Section IN ('ALL','BACKUP')
+    BEGIN
+        IF @Debug = 1 PRINT '[6] Backup & Recovery...';
+
+        /* Databases without a backup in 7 days */
+        DECLARE @NeverBackedUp INT, @StaleBackup INT;
+        SELECT @NeverBackedUp = COUNT(*)
+        FROM sys.databases d
+        LEFT JOIN msdb.dbo.backupset b
+            ON b.database_name = d.name AND b.type = 'D'
+        WHERE d.database_id > 4 AND d.state_desc = 'ONLINE' AND d.is_read_only = 0
+          AND b.backup_finish_date IS NULL;
+
+        SELECT @StaleBackup = COUNT(*)
+        FROM sys.databases d
+        INNER JOIN (
+            SELECT database_name, MAX(backup_finish_date) AS LastFull
+            FROM msdb.dbo.backupset WHERE type = 'D'
+            GROUP BY database_name
+        ) lb ON lb.database_name = d.name
+        WHERE d.database_id > 4 AND d.state_desc = 'ONLINE'
+          AND lb.LastFull < DATEADD(DAY, -7, GETDATE());
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Backup & Recovery','Backup Coverage','Databases Never Backed Up',
+            CAST(@NeverBackedUp AS NVARCHAR) + ' database(s)',
+            '0',
+            CASE WHEN @NeverBackedUp > 0 THEN 'CRITICAL' ELSE 'OK' END,
+            'Databases with no backup history cannot be recovered in the event of data loss. Implement a backup strategy immediately.',
+            'SELECT name FROM sys.databases d LEFT JOIN msdb.dbo.backupset b ON b.database_name = d.name AND b.type = ''D'' WHERE d.database_id > 4 AND b.backup_finish_date IS NULL GROUP BY d.name;',
+            'https://docs.microsoft.com/sql/relational-databases/backup-restore/back-up-and-restore-of-sql-server-databases';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Backup & Recovery','Backup Freshness','Full Backups Older Than 7 Days',
+            CAST(@StaleBackup AS NVARCHAR) + ' database(s)',
+            '0',
+            CASE WHEN @StaleBackup > 0 THEN 'WARNING' ELSE 'OK' END,
+            'Full backups older than 7 days increase recovery point objective (RPO). Review backup schedules.',
+            '-- Review backup history: SELECT database_name, MAX(backup_finish_date) AS LastFull FROM msdb.dbo.backupset WHERE type = ''D'' GROUP BY database_name ORDER BY LastFull;',
+            '';
+
+        /* Recovery model coverage */
+        DECLARE @SimpleRecovery INT;
+        SELECT @SimpleRecovery = COUNT(*)
+        FROM sys.databases
+        WHERE recovery_model_desc = 'SIMPLE' AND database_id > 4;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Backup & Recovery','Recovery Model','Databases in SIMPLE Recovery',
+            CAST(@SimpleRecovery AS NVARCHAR) + ' database(s)',
+            '0 production databases in SIMPLE recovery',
+            CASE WHEN @SimpleRecovery > 0 THEN 'WARNING' ELSE 'OK' END,
+            'SIMPLE recovery model does not support log backups, making point-in-time recovery impossible. Production databases should use FULL recovery with regular log backups.',
+            '-- Per database: ALTER DATABASE [<dbname>] SET RECOVERY FULL; -- Then immediately take a FULL backup.',
+            'https://docs.microsoft.com/sql/relational-databases/backup-restore/recovery-models-sql-server';
+
+        /* Backup Checksum */
+        DECLARE @BackupChecksum BIGINT;
+        SELECT @BackupChecksum = run_value FROM #SrvConfig WHERE name = 'backup checksum default';
+        INSERT INTO #ConfigAudit
+        SELECT 'Backup & Recovery','Backup Integrity','backup checksum default',
+            CASE ISNULL(@BackupChecksum,0) WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END,
+            'ENABLED',
+            CASE ISNULL(@BackupChecksum,0) WHEN 0 THEN 'WARNING' ELSE 'OK' END,
+            'Backup checksum validates data integrity during backup/restore. Enable to detect corruption before a restore is needed.',
+            'EXEC sp_configure ''backup checksum default'', 1; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/relational-databases/backup-restore/enable-or-disable-backup-checksums-during-backup-or-restore';
+
+    END -- [6] Backup
+
+
+    /* ============================================================
+       [7] NETWORK & CONNECTIONS
+    ============================================================ */
+    IF @Section IN ('ALL','NETWORK')
+    BEGIN
+        IF @Debug = 1 PRINT '[7] Network & Connections...';
+
+        DECLARE @MaxConnections BIGINT, @NetworkPacketSize BIGINT, @RemoteLoginTimeout BIGINT;
+        SELECT @MaxConnections      = run_value FROM #SrvConfig WHERE name = 'user connections';
+        SELECT @NetworkPacketSize   = run_value FROM #SrvConfig WHERE name = 'network packet size (B)';
+        SELECT @RemoteLoginTimeout  = run_value FROM #SrvConfig WHERE name = 'remote login timeout (s)';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Network','Connections','user connections (max)',
+            CASE @MaxConnections WHEN 0 THEN '0 (unlimited)' ELSE CAST(@MaxConnections AS NVARCHAR) END,
+            '0 (unlimited – let SQL Server manage)',
+            'OK',
+            'Limiting user connections can cause legitimate connections to be refused. Leave at 0 unless a specific throttling requirement exists.',
+            '',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/configure-the-user-connections-server-configuration-option';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Network','Packet Size','network packet size (B)',
+            CAST(@NetworkPacketSize AS NVARCHAR),
+            '4096 (default)',
+            CASE WHEN @NetworkPacketSize <> 4096 THEN 'INFO' ELSE 'OK' END,
+            'Non-default packet size may be beneficial for bulk data workloads (e.g., 8192 for DWH) but can increase memory usage per connection. Review if non-default.',
+            '',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/configure-the-network-packet-size-server-configuration-option';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Network','Timeout','remote login timeout (s)',
+            CAST(@RemoteLoginTimeout AS NVARCHAR),
+            '10–30 seconds',
+            CASE WHEN @RemoteLoginTimeout = 0 THEN 'WARNING'
+                 WHEN @RemoteLoginTimeout > 60 THEN 'INFO'
+                 ELSE 'OK' END,
+            CASE WHEN @RemoteLoginTimeout = 0
+                 THEN '0 = indefinite wait for remote login. Can cause hang if remote server is unreachable.'
+                 ELSE 'Remote login timeout is set.' END,
+            CASE WHEN @RemoteLoginTimeout = 0
+                 THEN 'EXEC sp_configure ''remote login timeout (s)'', 20; RECONFIGURE;'
+                 ELSE '' END,
+            '';
+
+        /* Blocked Process Threshold */
+        DECLARE @BlockedThreshold BIGINT;
+        SELECT @BlockedThreshold = run_value FROM #SrvConfig WHERE name = 'blocked process threshold (s)';
+        INSERT INTO #ConfigAudit
+        SELECT 'Network','Monitoring','blocked process threshold (s)',
+            CAST(@BlockedThreshold AS NVARCHAR),
+            '5 (enable blocking detection)',
+            CASE WHEN @BlockedThreshold = 0 THEN 'WARNING' ELSE 'OK' END,
+            'When set to 0, SQL Server does not raise ''blocked process report'' events. Setting this to 5+ enables detection via Extended Events or SQL Trace for blocking diagnostics.',
+            'EXEC sp_configure ''blocked process threshold (s)'', 5; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/database-engine/configure-windows/blocked-process-threshold-server-configuration-option';
+
+    END -- [7] Network
+
+
+    /* ============================================================
+       [8] DATABASE MAIL & ALERTING
+    ============================================================ */
+    IF @Section IN ('ALL','MAIL')
+    BEGIN
+        IF @Debug = 1 PRINT '[8] Database Mail & Alerts...';
+
+        DECLARE @DBMailEnabled BIGINT;
+        SELECT @DBMailEnabled = run_value FROM #SrvConfig WHERE name = 'Database Mail XPs';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Mail & Alerts','Database Mail','Database Mail XPs',
+            CASE @DBMailEnabled WHEN 1 THEN 'ENABLED' ELSE 'DISABLED' END,
+            'ENABLED (if alerting required)',
+            CASE WHEN @DBMailEnabled = 0 THEN 'INFO' ELSE 'OK' END,
+            'Database Mail is required for SQL Agent alerts and operator notifications. Enable if alerting is needed.',
+            'EXEC sp_configure ''Database Mail XPs'', 1; RECONFIGURE;',
+            'https://docs.microsoft.com/sql/relational-databases/database-mail/database-mail';
+
+        /* SQL Agent: operator for alerts */
+        DECLARE @OperatorCount INT;
+        SELECT @OperatorCount = COUNT(*) FROM msdb.dbo.sysoperators WHERE enabled = 1;
+        INSERT INTO #ConfigAudit
+        SELECT 'Mail & Alerts','SQL Agent','Enabled SQL Agent Operators',
+            CAST(@OperatorCount AS NVARCHAR),
+            '≥ 1 enabled operator',
+            CASE WHEN @OperatorCount = 0 THEN 'WARNING' ELSE 'OK' END,
+            'Without at least one enabled operator, SQL Agent cannot send alert notifications. Configure an operator with a valid email address.',
+            '-- SSMS: SQL Server Agent → Operators → New Operator',
+            'https://docs.microsoft.com/sql/ssms/agent/create-an-operator';
+
+        /* Severity 17-25 alerts */
+        DECLARE @SevAlertCount INT;
+        SELECT @SevAlertCount = COUNT(*)
+        FROM msdb.dbo.sysalerts
+        WHERE severity BETWEEN 17 AND 25 AND enabled = 1;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Mail & Alerts','SQL Agent','Severity 17-25 Alerts Configured',
+            CAST(@SevAlertCount AS NVARCHAR) + ' alert(s)',
+            '9 alerts (severity 17–25)',
+            CASE WHEN @SevAlertCount < 9 THEN 'WARNING' ELSE 'OK' END,
+            'Severity 17-25 errors are serious SQL Server errors (insufficient resources through fatal errors). Configure alerts for all severity levels so the DBA is immediately notified.',
+            '-- Script to create all severity alerts: see SQL Server best practices guides or sp_Blitz scripts.',
+            'https://docs.microsoft.com/sql/ssms/agent/create-an-alert-using-severity-level';
+
+        /* Error 823, 824, 825 alerts */
+        DECLARE @IOErrorAlerts INT;
+        SELECT @IOErrorAlerts = COUNT(*)
+        FROM msdb.dbo.sysalerts
+        WHERE message_id IN (823, 824, 825) AND enabled = 1;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Mail & Alerts','SQL Agent','I/O Error Alerts (823/824/825)',
+            CAST(@IOErrorAlerts AS NVARCHAR) + ' of 3 configured',
+            '3 (errors 823, 824, 825)',
+            CASE WHEN @IOErrorAlerts < 3 THEN 'WARNING' ELSE 'OK' END,
+            'Errors 823/824/825 indicate I/O corruption. These are critical early-warning signs of hardware failure. Alert on all three.',
+            '-- Create alert for each: EXEC msdb.dbo.sp_add_alert @name=N''Err 823'', @message_id=823, @severity=0, @enabled=1, ...',
+            'https://docs.microsoft.com/sql/relational-databases/errors-events/mssqlserver-823-database-engine-error';
+
+    END -- [8] Mail
+
+
+    /* ============================================================
+       [9] TEMPDB BEST PRACTICES
+    ============================================================ */
+    IF @Section IN ('ALL','TEMPDB')
+    BEGIN
+        IF @Debug = 1 PRINT '[9] TempDB...';
+
+        DECLARE @TempDataFiles    INT, @TempLogFiles INT;
+        DECLARE @TempFilesDiffSize INT;
+        DECLARE @RecommTempFiles  INT;
+
+        SELECT @TempDataFiles = COUNT(*)
+        FROM tempdb.sys.database_files WHERE type = 0;
+
+        SELECT @TempLogFiles = COUNT(*)
+        FROM tempdb.sys.database_files WHERE type = 1;
+
+        -- Recommendation: 1 file per logical CPU, max 8
+        SET @RecommTempFiles = CASE WHEN @LogicalCPUs > 8 THEN 8 ELSE @LogicalCPUs END;
+
+        /* File count */
+        INSERT INTO #ConfigAudit
+        SELECT 'TempDB','File Count','TempDB Data File Count',
+            CAST(@TempDataFiles AS NVARCHAR),
+            CAST(@RecommTempFiles AS NVARCHAR) + ' (1 per logical CPU, max 8)',
+            CASE WHEN @TempDataFiles = 1 THEN 'CRITICAL'
+                 WHEN @TempDataFiles < @RecommTempFiles THEN 'WARNING'
+                 ELSE 'OK' END,
+            'A single TempDB data file creates allocation contention on SGAM/GAM/PFS pages under concurrent load. Multiple equal-sized files dramatically reduce contention.',
+            '-- Add TempDB data files (adjust path):' + CHAR(13) +
+            'ALTER DATABASE tempdb ADD FILE (NAME = N''tempdev2'', FILENAME = N''<drive>:\tempdb\tempdev2.ndf'', SIZE = 1024MB, FILEGROWTH = 256MB);',
+            'https://docs.microsoft.com/sql/relational-databases/databases/tempdb-database';
+
+        /* Equal sizing */
+        SELECT @TempFilesDiffSize = COUNT(DISTINCT size)
+        FROM tempdb.sys.database_files WHERE type = 0;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'TempDB','File Sizing','TempDB Data Files – Equal Size',
+            CASE @TempFilesDiffSize WHEN 1 THEN 'YES – all files equal size' ELSE 'NO – files differ in size' END,
+            'All data files must be equal size',
+            CASE WHEN @TempFilesDiffSize > 1 THEN 'WARNING' ELSE 'OK' END,
+            'Unequal TempDB data files defeat proportional fill, causing SQL Server to preferentially write to the larger file and negating the benefit of multiple files.',
+            '-- Resize all files to the same size using ALTER DATABASE tempdb MODIFY FILE (...)',
+            'https://support.microsoft.com/kb/2154845';
+
+        /* TempDB on separate drive */
+        DECLARE @TempDBDrive NVARCHAR(3), @DataDrive NVARCHAR(3);
+        SELECT TOP 1 @TempDBDrive = LEFT(physical_name, 3)
+        FROM tempdb.sys.database_files WHERE type = 0;
+        SELECT TOP 1 @DataDrive = LEFT(physical_name, 3)
+        FROM sys.master_files WHERE database_id = 1 AND type = 0; -- master
+
+        INSERT INTO #ConfigAudit
+        SELECT 'TempDB','Placement','TempDB on Separate Drive',
+            'TempDB drive: ' + ISNULL(@TempDBDrive,'?') + ' | System DB drive: ' + ISNULL(@DataDrive,'?'),
+            'Separate fast drive (SSD/NVMe recommended)',
+            CASE WHEN @TempDBDrive = @DataDrive THEN 'WARNING' ELSE 'OK' END,
+            'Placing TempDB on the same drive as system databases or user databases allows TempDB I/O to impact other workloads. Use a dedicated fast drive.',
+            '-- Move TempDB: ALTER DATABASE tempdb MODIFY FILE (NAME = tempdev, FILENAME = ''<new_drive>:\...''); -- then restart SQL.',
+            'https://docs.microsoft.com/sql/relational-databases/databases/move-system-databases';
+
+        /* Trace flag 1117 / 1118 (SQL 2014 and below) */
+        IF @MajorVersion < 13
+        BEGIN
+            INSERT INTO #ConfigAudit
+            SELECT 'TempDB','Trace Flags','Trace Flags 1117 & 1118 (pre-SQL 2016)',
+                'Check via DBCC TRACESTATUS(1117,1118)',
+                'ENABLED (on SQL 2014 and below)',
+                'INFO',
+                'On SQL Server 2014 and below, trace flags 1117 (uniform extent growth) and 1118 (uniform extent allocation) are required to optimise TempDB. These are default behaviour in SQL 2016+.',
+                'DBCC TRACEON(1117, -1); DBCC TRACEON(1118, -1); -- Add to startup parameters as -T1117 -T1118',
+                'https://support.microsoft.com/kb/328551';
+        END
+
+    END -- [9] TempDB
+
+
+    /* ============================================================
+       [10] FULL sp_configure AUDIT (all settings vs best practice)
+    ============================================================ */
+    IF @Section IN ('ALL','CONFIG')
+    BEGIN
+        IF @Debug = 1 PRINT '[10] Full sp_configure audit...';
+
+        -- Compare every key setting against known best practice table
+        IF OBJECT_ID('tempdb..#BestPractice') IS NOT NULL DROP TABLE #BestPractice;
+        CREATE TABLE #BestPractice (
+            SettingName      NVARCHAR(100),
+            RecommendedValue NVARCHAR(100),
+            Operator         CHAR(2),     -- '= ' | '>=' | '<=' | '!='
+            DefaultIsOK      BIT,
+            ImpactNote       NVARCHAR(500)
+        );
+
+        INSERT INTO #BestPractice VALUES
+        ('show advanced options',          '1',          '= ', 1, 'Required to view/change advanced settings.'),
+        ('max server memory (MB)',         '<calculated>','!= ', 0,'Must be set below OS RAM. See Memory section.'),
+        ('min server memory (MB)',         '0',          '= ', 1, 'OK at 0; raise only on dedicated SQL Server.'),
+        ('max degree of parallelism',      '0',          '!=', 0, 'MAXDOP 0 = unlimited, risk of CPU storms.'),
+        ('cost threshold for parallelism', '50',         '>=', 0, 'Default of 5 is too low.'),
+        ('optimize for ad hoc workloads',  '1',          '= ', 0, 'Prevents plan cache bloat from single-use plans.'),
+        ('backup compression default',     '1',          '= ', 0, 'Reduce backup I/O and storage.'),
+        ('backup checksum default',        '1',          '= ', 0, 'Detect backup corruption early.'),
+        ('blocked process threshold (s)',  '5',          '>=', 0, 'Enable blocking detection events.'),
+        ('xp_cmdshell',                    '0',          '= ', 1, 'High-risk OS access. Disable unless required.'),
+        ('clr enabled',                    '0',          '= ', 1, 'Disable unless .NET assemblies in use.'),
+        ('Ole Automation Procedures',      '0',          '= ', 1, 'COM objects inside SQL. Disable.'),
+        ('cross db ownership chaining',    '0',          '= ', 1, 'Security boundary bypass. Disable.'),
+        ('priority boost',                 '0',          '= ', 1, 'OS starvation risk. Disable.'),
+        ('lightweight pooling',            '0',          '= ', 1, 'Fiber mode. Obsolete and risky. Disable.'),
+        ('remote admin connections',       '1',          '= ', 0, 'Enable DAC for emergency access.'),
+        ('Database Mail XPs',              '1',          '= ', 0, 'Required for alerting.'),
+        ('fill factor (%)',                '0',          '= ', 1, '0 = 100% fill. Set per-index, not globally, unless justified.'),
+        ('remote login timeout (s)',       '20',         '>=', 0, '0 = indefinite hang risk.'),
+        ('network packet size (B)',        '4096',       '= ', 1, 'Non-default may impact memory per connection.');
+
+        INSERT INTO #ConfigAudit (Section, Category, SettingName, CurrentValue,
+                                   RecommendedValue, Status, Impact, FixScript, Reference)
+        SELECT
+            'Full Config Audit',
+            'sp_configure',
+            sc.name,
+            CAST(sc.run_value AS NVARCHAR),
+            bp.RecommendedValue,
+            CASE
+                WHEN bp.RecommendedValue = '<calculated>' THEN 'INFO'
+                WHEN bp.Operator = '= '  AND sc.run_value = CAST(bp.RecommendedValue AS BIGINT) THEN 'OK'
+                WHEN bp.Operator = '!='  AND sc.run_value <> CAST(bp.RecommendedValue AS BIGINT) THEN 'WARNING'
+                WHEN bp.Operator = '>='  AND sc.run_value >= CAST(bp.RecommendedValue AS BIGINT) THEN 'OK'
+                WHEN bp.Operator = '>='  AND sc.run_value < CAST(bp.RecommendedValue AS BIGINT)  THEN 'WARNING'
+                ELSE 'WARNING'
+            END,
+            bp.ImpactNote,
+            CASE
+                WHEN bp.RecommendedValue = '<calculated>' THEN '-- See Memory section for formula'
+                WHEN bp.Operator = '!='  THEN 'EXEC sp_configure ''' + sc.name + ''', ' + bp.RecommendedValue + '; RECONFIGURE WITH OVERRIDE;'
+                WHEN bp.Operator = '= '
+                     AND sc.run_value <> CAST(bp.RecommendedValue AS BIGINT)
+                THEN 'EXEC sp_configure ''' + sc.name + ''', ' + bp.RecommendedValue + '; RECONFIGURE WITH OVERRIDE;'
+                ELSE ''
+            END,
+            'sys.configurations'
+        FROM #SrvConfig sc
+        INNER JOIN #BestPractice bp ON sc.name = bp.SettingName;
+
+        /* Show ALL sp_configure values for full reference */
+        SELECT
+            'FULL sp_configure REFERENCE'                                AS Section,
+            name                                                         AS SettingName,
+            description,
+            CAST(value          AS NVARCHAR(50))                         AS ConfigValue,
+            CAST(value_in_use   AS NVARCHAR(50))                         AS RunValue,
+            CAST(minimum        AS NVARCHAR(50))                         AS MinAllowed,
+            CAST(maximum        AS NVARCHAR(50))                         AS MaxAllowed,
+            CASE WHEN CAST(value AS NVARCHAR(50)) <> CAST(value_in_use AS NVARCHAR(50)) 
+                 THEN '⚠ Pending restart/RECONFIGURE' ELSE '✅ Applied' END AS ApplyStatus,
+            is_dynamic,
+            is_advanced
+        FROM sys.configurations
+        ORDER BY name;
+
+    END -- [10] Full Config
+
+
+    /* ============================================================
+       [11] DATABASE-LEVEL CHECKS
+    ============================================================ */
+    IF @Section IN ('ALL','DATABASE')
+    BEGIN
+        IF @Debug = 1 PRINT '[11] Database-level checks...';
+
+        SELECT
+            'DATABASE CONFIGURATION REVIEW'                              AS Section,
+            name                                                         AS DatabaseName,
+            state_desc                                                   AS State,
+            recovery_model_desc                                          AS RecoveryModel,
+            compatibility_level                                          AS CompatLevel,
+            page_verify_option_desc                                      AS PageVerify,
+            log_reuse_wait_desc                                          AS LogReuseWait,
+            CASE is_auto_close_on  WHEN 1 THEN '⚠ ON'  ELSE 'OK' END   AS AutoClose,
+            CASE is_auto_shrink_on WHEN 1 THEN '⚠ ON'  ELSE 'OK' END   AS AutoShrink,
+            CASE is_auto_update_stats_on WHEN 0 THEN '⚠ OFF' ELSE 'OK' END AS AutoUpdateStats,
+            CASE is_auto_create_stats_on WHEN 0 THEN '⚠ OFF' ELSE 'OK' END AS AutoCreateStats,
+            CASE snapshot_isolation_state_desc
+                 WHEN 'OFF' THEN 'OFF'
+                 ELSE snapshot_isolation_state_desc END                  AS SnapshotIsolation,
+            CASE is_read_committed_snapshot_on WHEN 1 THEN '✅ ON' ELSE 'OFF' END AS RCSI,
+            CASE is_trustworthy_on WHEN 1 THEN '⚠ TRUSTWORTHY ON' ELSE 'OK' END AS Trustworthy,
+            CASE is_db_chaining_on WHEN 1 THEN '⚠ CHAINING ON' ELSE 'OK' END AS Chaining,
+            CASE compatibility_level
+                 WHEN (SELECT compatibility_level FROM sys.databases WHERE name = 'model')
+                 THEN 'OK'
+                 ELSE '⚠ Below current (' +
+                      CAST((SELECT compatibility_level FROM sys.databases WHERE name='model') AS NVARCHAR) + ')' END
+                                                                         AS CompatCheck
+        FROM sys.databases
+        ORDER BY database_id;
+
+    END -- [11] Database level
+
+
+    /* ============================================================
+       [12] ACTIVE TRACE FLAGS
+    ============================================================ */
+    IF @Section IN ('ALL','TRACEFLAGS')
+    BEGIN
+        IF @Debug = 1 PRINT '[12] Trace Flags...';
+
+        IF OBJECT_ID('tempdb..#TraceFlags') IS NOT NULL DROP TABLE #TraceFlags;
+        CREATE TABLE #TraceFlags (TraceFlag INT, Status INT, Global INT, Session INT);
+        INSERT INTO #TraceFlags EXEC ('DBCC TRACESTATUS(-1) WITH NO_INFOMSGS');
+
+        IF EXISTS (SELECT 1 FROM #TraceFlags)
+        BEGIN
+            SELECT
+                'ACTIVE TRACE FLAGS'                                     AS Section,
+                tf.TraceFlag,
+                tf.Global,
+                tf.Session,
+                CASE tf.TraceFlag
+                    WHEN 1117 THEN '✅ TempDB uniform extent growth (needed pre-SQL2016)'
+                    WHEN 1118 THEN '✅ TempDB uniform single-page allocation (needed pre-SQL2016)'
+                    WHEN 1204 THEN '⚠ Deadlock info (old format). Prefer Extended Events.'
+                    WHEN 1222 THEN '✅ Deadlock info (XML format). Good practice.'
+                    WHEN 2371 THEN '⚠ Lowered auto-stats threshold. Use only if needed.'
+                    WHEN 3226 THEN '✅ Suppresses successful backup messages in error log. Recommended.'
+                    WHEN 4199 THEN '⚠ All QO hotfixes enabled. Test thoroughly first.'
+                    WHEN 7412 THEN '✅ Lightweight query profiling (SQL 2016 SP1). Recommended.'
+                    WHEN 8048 THEN '⚠ NUMA partition memory objects. Only for specific contention.'
+                    WHEN 9481 THEN '⚠ Forces legacy CE (70). Avoid if possible; use hint instead.'
+                    ELSE 'ℹ Review: verify this trace flag is intentional'
+                END                                                      AS Recommendation
+            FROM #TraceFlags tf;
+        END
+        ELSE
+        BEGIN
+            SELECT 'ACTIVE TRACE FLAGS' AS Section, 'No global trace flags active.' AS Note;
+        END
+
+        /* Recommended trace flags not active */
+        DECLARE @TF3226 INT = 0, @TF1222 INT = 0;
+        SELECT @TF3226 = COUNT(*) FROM #TraceFlags WHERE TraceFlag = 3226;
+        SELECT @TF1222 = COUNT(*) FROM #TraceFlags WHERE TraceFlag = 1222;
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Trace Flags','Logging','Trace Flag 3226 (suppress backup log noise)',
+            CASE @TF3226 WHEN 0 THEN 'NOT ACTIVE' ELSE 'ACTIVE' END,
+            'ACTIVE',
+            CASE @TF3226 WHEN 0 THEN 'INFO' ELSE 'OK' END,
+            'TF 3226 suppresses the ''BACKUP DATABASE successfully processed'' message in the SQL error log. Without it, frequent log backups flood the error log, hiding real errors.',
+            'DBCC TRACEON(3226, -1); -- Add ''-T3226'' to SQL Server startup parameters for persistence.',
+            'https://docs.microsoft.com/sql/t-sql/database-console-commands/dbcc-traceon-transact-sql';
+
+        INSERT INTO #ConfigAudit
+        SELECT 'Trace Flags','Diagnostics','Trace Flag 1222 (deadlock XML)',
+            CASE @TF1222 WHEN 0 THEN 'NOT ACTIVE' ELSE 'ACTIVE' END,
+            'ACTIVE (or use Extended Events)',
+            CASE @TF1222 WHEN 0 THEN 'INFO' ELSE 'OK' END,
+            'TF 1222 writes deadlock information to the SQL error log in XML format. Useful for deadlock diagnosis. Extended Events system_health session captures this by default in SQL 2008+.',
+            'DBCC TRACEON(1222, -1); -- Or rely on Extended Events system_health session.',
+            '';
+
+    END -- [12] Trace Flags
+
+
+    /* ============================================================
+       [13] MISSING CONFIGURATION SUMMARY  (consolidated output)
+    ============================================================ */
+    IF @Section IN ('ALL','SUMMARY')
+    BEGIN
+        IF @Debug = 1 PRINT '[13] Missing Configuration Summary...';
+
+        -- Return consolidated findings with severity ordering
+        SELECT
+            AuditID,
+            CASE Status
+                WHEN 'CRITICAL' THEN '🔴 CRITICAL'
+                WHEN 'WARNING'  THEN '🟠 WARNING'
+                WHEN 'MISSING'  THEN '🔴 MISSING'
+                WHEN 'INFO'     THEN '🔵 INFO'
+                ELSE                 '✅ OK'
+            END                                                          AS Severity,
+            Section,
+            Category,
+            SettingName,
+            CurrentValue,
+            RecommendedValue,
+            Impact,
+            CASE WHEN @GenerateFixScript = 1 THEN FixScript ELSE '(use @GenerateFixScript=1)' END
+                                                                         AS FixScript,
+            Reference
+        FROM #ConfigAudit
+        WHERE (@ShowOKItems = 1 OR Status NOT IN ('OK'))
+          AND Status NOT IN ('OK')        -- Summary = issues only
+        ORDER BY
+            CASE Status
+                WHEN 'CRITICAL' THEN 1
+                WHEN 'MISSING'  THEN 1
+                WHEN 'WARNING'  THEN 2
+                WHEN 'INFO'     THEN 3
+                ELSE 4 END,
+            Section, AuditID;
+
+        /* Count by severity */
+        SELECT
+            'CONFIGURATION SCORE'                                        AS Section,
+            COUNT(CASE WHEN Status IN ('CRITICAL','MISSING') THEN 1 END) AS Critical_Count,
+            COUNT(CASE WHEN Status = 'WARNING'               THEN 1 END) AS Warning_Count,
+            COUNT(CASE WHEN Status = 'INFO'                  THEN 1 END) AS Info_Count,
+            COUNT(CASE WHEN Status = 'OK'                    THEN 1 END) AS OK_Count,
+            COUNT(*)                                                     AS Total_Checks,
+            CAST(
+                100.0 * COUNT(CASE WHEN Status = 'OK' THEN 1 END)
+                / NULLIF(COUNT(*),0)
+            AS DECIMAL(5,1))                                             AS HealthScore_Pct,
+            @ServerName                                                  AS ServerName,
+            CONVERT(NVARCHAR(20), @NowUTC, 120)                         AS AuditRunTime_UTC
+        FROM #ConfigAudit;
+
+    END -- [13] Summary
+
+
+    /* ============================================================
+       DEFAULT FULL OUTPUT (when @Section = 'ALL')
+       Return all sections with their detail rows
+    ============================================================ */
+    IF @Section = 'ALL'
+    BEGIN
+        SELECT
+            AuditID,
+            Section,
+            Category,
+            SettingName,
+            CurrentValue,
+            RecommendedValue,
+            CASE Status
+                WHEN 'CRITICAL' THEN '🔴 CRITICAL'
+                WHEN 'WARNING'  THEN '🟠 WARNING'
+                WHEN 'MISSING'  THEN '🔴 MISSING'
+                WHEN 'INFO'     THEN '🔵 INFO'
+                ELSE                 '✅ OK'
+            END                                                          AS Status,
+            Impact,
+            CASE WHEN @GenerateFixScript = 1 THEN FixScript ELSE '' END AS FixScript,
+            Reference
+        FROM #ConfigAudit
+        WHERE (@ShowOKItems = 1 OR Status NOT IN ('OK'))
+        ORDER BY
+            CASE Status
+                WHEN 'CRITICAL' THEN 1
+                WHEN 'MISSING'  THEN 1
+                WHEN 'WARNING'  THEN 2
+                WHEN 'INFO'     THEN 3
+                ELSE 4 END,
+            Section, AuditID;
+    END
+
+    /* ============================================================
+       FIX SCRIPT OUTPUT
+    ============================================================ */
+    IF @GenerateFixScript = 1 AND @Section = 'ALL'
+    BEGIN
+        DECLARE @FS NVARCHAR(MAX) = N'';
+        SELECT @FS = @FS +
+            CASE WHEN LEN(LTRIM(RTRIM(FixScript))) > 0
+                 THEN '-- [' + Section + '] ' + SettingName + CHAR(13) + CHAR(10)
+                    + FixScript + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10)
+                 ELSE '' END
+        FROM #ConfigAudit
+        WHERE Status IN ('CRITICAL','WARNING','MISSING')
+          AND LEN(LTRIM(RTRIM(FixScript))) > 0
+        ORDER BY CASE Status WHEN 'CRITICAL' THEN 1 WHEN 'MISSING' THEN 1 ELSE 2 END, AuditID;
+
+        IF LEN(@FS) > 0
+        BEGIN
+            PRINT '/* ===== AUTO-GENERATED FIX SCRIPT ===== ';
+            PRINT '   Review carefully before executing!     ';
+            PRINT '   Server : ' + @ServerName;
+            PRINT '   Generated: ' + CONVERT(NVARCHAR(20), @NowUTC, 120) + ' UTC';
+            PRINT '   ======================================= */';
+            PRINT '';
+            -- Print in chunks (PRINT limit = 8000 chars)
+            DECLARE @pos INT = 1;
+            WHILE @pos <= LEN(@FS)
+            BEGIN
+                PRINT SUBSTRING(@FS, @pos, 4000);
+                SET @pos += 4000;
+            END
+        END
+    END
+
+    /* ============================================================
+       CLEANUP
+    ============================================================ */
+    IF OBJECT_ID('tempdb..#ConfigAudit') IS NOT NULL DROP TABLE #ConfigAudit;
+    IF OBJECT_ID('tempdb..#SrvConfig')   IS NOT NULL DROP TABLE #SrvConfig;
+    IF OBJECT_ID('tempdb..#BestPractice')IS NOT NULL DROP TABLE #BestPractice;
+    IF OBJECT_ID('tempdb..#TraceFlags')  IS NOT NULL DROP TABLE #TraceFlags;
+
+    IF @Debug = 1 PRINT '== sp_serverconfiguration complete ==';
+
+END -- Procedure
+GO
+
+/*
+================================================================
+GRANT EXECUTE (adjust login/role as needed)
+================================================================
+GRANT EXECUTE ON dbo.sp_serverconfiguration TO [<MonitoringLogin>];
+GO
+
+================================================================
+USAGE EXAMPLES
+================================================================
+
+-- Full audit (all 13 sections + summary + fix script):
+EXEC dbo.sp_serverconfiguration;
+
+-- Issues only (skip OK items for a quick triage view):
+EXEC dbo.sp_serverconfiguration @ShowOKItems = 0;
+
+-- Single section – memory only:
+EXEC dbo.sp_serverconfiguration @Section = 'MEMORY';
+
+-- Security hardening review:
+EXEC dbo.sp_serverconfiguration @Section = 'SECURITY';
+
+-- All sections, no fix script output:
+EXEC dbo.sp_serverconfiguration @GenerateFixScript = 0;
+
+-- Debug mode (prints section headers in Messages tab):
+EXEC dbo.sp_serverconfiguration @Debug = 1;
+
+-- Show only warnings/critical across full audit:
+EXEC dbo.sp_serverconfiguration @Section = 'ALL', @ShowOKItems = 0, @GenerateFixScript = 1;
+
+================================================================
+SECTIONS  (@Section values)
+================================================================
+  ALL         – everything (default)
+  INFO        – server identity & hardware
+  MEMORY      – max/min memory, PLE, LPIM
+  CPU         – MAXDOP, CTFP, fiber mode, priority boost
+  SECURITY    – xp_cmdshell, CLR, SA, sysadmin count, auth mode
+  IO          – backup compression, page verify, IFI, file growth
+  BACKUP      – backup coverage, recovery models, checksum
+  NETWORK     – connections, packet size, blocked threshold
+  MAIL        – Database Mail, operators, severity alerts
+  TEMPDB      – file count, equal size, placement, trace flags
+  CONFIG      – full sp_configure reference table
+  DATABASE    – per-DB auto-close, auto-shrink, compat level, RCSI
+  TRACEFLAGS  – active trace flags + recommendations
+  SUMMARY     – consolidated issues + health score
+================================================================
+*/
+
+EXEC dbo.sp_serverconfiguration;
