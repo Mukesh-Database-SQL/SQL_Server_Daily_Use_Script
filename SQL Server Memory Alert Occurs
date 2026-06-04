@@ -1,0 +1,260 @@
+-- ============================================================
+-- Author      : Mukesh Kumar Chaurasia
+-- Created     : 2026
+-- Description : SQL Server Memory Health Check - Combined View
+-- Usage       : EXEC sp_memoryhealthcheck
+-- ============================================================
+
+USE master;
+GO
+
+IF OBJECT_ID('sp_memoryhealthcheck', 'P') IS NOT NULL
+    DROP PROCEDURE sp_memoryhealthcheck;
+GO
+
+CREATE PROCEDURE sp_memoryhealthcheck
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 1: OVERALL MEMORY SUMMARY
+    -- ─────────────────────────────────────────────
+    PRINT '=========================================='
+    PRINT ' SECTION 1: OVERALL MEMORY SUMMARY'
+    PRINT '=========================================='
+
+    SELECT
+        physical_memory_in_use_kb  / 1024          AS [SQL Used Memory (MB)],
+        large_page_allocations_kb  / 1024          AS [Large Page Alloc (MB)],
+        locked_page_allocations_kb / 1024          AS [Locked Pages (MB)],
+        page_fault_count                           AS [Page Faults],
+        memory_utilization_percentage              AS [SQL Memory Util %]
+    FROM sys.dm_os_process_memory;
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 2: SERVER PHYSICAL vs SQL MEMORY
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 2: SERVER vs SQL MEMORY'
+    PRINT '=========================================='
+
+    SELECT
+        total_physical_memory_kb     / 1024  AS [Total Server RAM (MB)],
+        available_physical_memory_kb / 1024  AS [Available RAM (MB)],
+        total_page_file_kb           / 1024  AS [Total Page File (MB)],
+        available_page_file_kb       / 1024  AS [Available Page File (MB)],
+        system_memory_state_desc                  AS [Memory State]
+    FROM sys.dm_os_sys_memory;
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 3: MAX SERVER MEMORY CONFIGURATION
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 3: MAX SERVER MEMORY CONFIG'
+    PRINT '=========================================='
+
+    SELECT
+        name                                   AS [Config Name],
+        value_in_use                           AS [Configured Value (MB)],
+        CASE
+            WHEN CAST(value_in_use AS BIGINT) >= 2147483647
+            THEN '⚠ WARNING: Unlimited (Not Recommended!)'
+            ELSE '✓ OK'
+        END                                    AS [Status]
+    FROM sys.configurations
+    WHERE name IN ('max server memory (MB)', 'min server memory (MB)');
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 4: PAGE LIFE EXPECTANCY (PLE)
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 4: PAGE LIFE EXPECTANCY (PLE)'
+    PRINT '=========================================='
+
+    SELECT
+        object_name                            AS [Object],
+        counter_name                           AS [Counter],
+        cntr_value                             AS [PLE (Seconds)],
+        CASE
+            WHEN cntr_value < 300  THEN '🔴 CRITICAL - Memory Pressure!'
+            WHEN cntr_value < 1000 THEN '🟡 WARNING  - Monitor Closely'
+            ELSE                        '🟢 HEALTHY'
+        END                                    AS [PLE Status]
+    FROM sys.dm_os_performance_counters
+    WHERE counter_name = 'Page life expectancy'
+      AND object_name LIKE '%Buffer Manager%';
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 5: BUFFER POOL USAGE
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 5: BUFFER POOL USAGE (TOP DBs)'
+    PRINT '=========================================='
+
+    SELECT TOP 10
+        ISNULL(DB_NAME(database_id), 'ResourceDB') AS [Database],
+        COUNT(*) * 8 / 1024                        AS [Buffer Pool (MB)],
+        COUNT(*)                                   AS [Pages Cached]
+    FROM sys.dm_os_buffer_descriptors
+    GROUP BY database_id
+    ORDER BY COUNT(*) DESC;
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 6: MEMORY CLERKS (TOP CONSUMERS)
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 6: TOP MEMORY CLERKS'
+    PRINT '=========================================='
+
+    SELECT TOP 10
+        type                                   AS [Memory Clerk],
+        SUM(pages_kb) / 1024                   AS [Used Memory (MB)]
+    FROM sys.dm_os_memory_clerks
+    GROUP BY type
+    ORDER BY SUM(pages_kb) DESC;
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 7: PLAN CACHE (AD-HOC WASTE)
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 7: PLAN CACHE ANALYSIS'
+    PRINT '=========================================='
+
+    SELECT
+        SUM(size_in_bytes) / 1024 / 1024                                       AS [Total Plan Cache (MB)],
+        SUM(CASE WHEN usecounts = 1 THEN size_in_bytes ELSE 0 END)/1024/1024   AS [Single-Use (Wasted) MB],
+        COUNT(*)                                                                AS [Total Cached Plans],
+        SUM(CASE WHEN usecounts = 1 THEN 1 ELSE 0 END)                         AS [Single-Use Plans],
+        CAST(
+            ROUND(
+                100.0 * SUM(CASE WHEN usecounts=1 THEN size_in_bytes ELSE 0 END)
+                / NULLIF(SUM(size_in_bytes),0), 2)
+        AS DECIMAL(5,2))                                                       AS [Waste %]
+    FROM sys.dm_exec_cached_plans;
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 8: MEMORY GRANT WAITS
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 8: MEMORY GRANT WAITS'
+    PRINT '=========================================='
+
+    SELECT
+        wait_type                              AS [Wait Type],
+        waiting_tasks_count                    AS [Waiting Tasks],
+        wait_time_ms / 1000                    AS [Total Wait (Sec)],
+        CASE
+            WHEN waiting_tasks_count > 100 THEN '🔴 HIGH - Queries Queued for Memory!'
+            WHEN waiting_tasks_count > 10  THEN '🟡 MEDIUM - Monitor'
+            ELSE                                '🟢 LOW - OK'
+        END                                    AS [Status]
+    FROM sys.dm_os_wait_stats
+    WHERE wait_type IN ('RESOURCE_SEMAPHORE', 'RESOURCE_SEMAPHORE_QUERY_COMPILE')
+      AND waiting_tasks_count > 0;
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 9: IN-MEMORY OLTP (XTP) USAGE
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 9: IN-MEMORY OLTP (XTP) USAGE'
+    PRINT '=========================================='
+
+    IF EXISTS (
+        SELECT 1 FROM sys.dm_os_memory_clerks
+        WHERE type LIKE '%XTP%' AND pages_kb > 0
+    )
+    BEGIN
+        SELECT
+            type                               AS [XTP Clerk],
+            SUM(pages_kb) / 1024               AS [Memory Used (MB)]
+        FROM sys.dm_os_memory_clerks
+        WHERE type LIKE '%XTP%'
+        GROUP BY type
+        ORDER BY SUM(pages_kb) DESC;
+    END
+    ELSE
+        SELECT 'No In-Memory OLTP (XTP) usage detected.' AS [XTP Status];
+
+
+    -- ─────────────────────────────────────────────
+    -- SECTION 10: QUICK HEALTH SCORECARD
+    -- ─────────────────────────────────────────────
+    PRINT ''
+    PRINT '=========================================='
+    PRINT ' SECTION 10: MEMORY HEALTH SCORECARD'
+    PRINT '=========================================='
+
+    SELECT
+        -- PLE Status
+        (SELECT CASE
+            WHEN cntr_value >= 1000 THEN '🟢 HEALTHY'
+            WHEN cntr_value >= 300  THEN '🟡 WARNING'
+            ELSE '🔴 CRITICAL'
+         END
+         FROM sys.dm_os_performance_counters
+         WHERE counter_name = 'Page life expectancy'
+           AND object_name LIKE '%Buffer Manager%')        AS [PLE Status],
+
+        -- Max Memory Config
+        (SELECT CASE
+            WHEN CAST(value_in_use AS BIGINT) >= 2147483647 THEN '🔴 NOT SET'
+            ELSE '🟢 CONFIGURED'
+         END
+         FROM sys.configurations
+         WHERE name = 'max server memory (MB)')            AS [Max Memory Config],
+
+        -- Memory Pressure
+        (SELECT CASE
+            WHEN memory_utilization_percentage >= 95 THEN '🔴 HIGH PRESSURE'
+            WHEN memory_utilization_percentage >= 80 THEN '🟡 MODERATE'
+            ELSE '🟢 NORMAL'
+         END
+         FROM sys.dm_os_process_memory)                    AS [Memory Pressure],
+
+        -- Page Faults
+        (SELECT CASE
+            WHEN page_fault_count > 1000000 THEN '🔴 HIGH PAGE FAULTS'
+            ELSE '🟢 NORMAL'
+         END
+         FROM sys.dm_os_process_memory)                    AS [Page Fault Status],
+
+        -- Resource Semaphore
+        (SELECT CASE
+            WHEN SUM(waiting_tasks_count) > 100 THEN '🔴 QUEUE BUILDING'
+            WHEN SUM(waiting_tasks_count) > 10  THEN '🟡 SOME WAITS'
+            ELSE '🟢 OK'
+         END
+         FROM sys.dm_os_wait_stats
+         WHERE wait_type LIKE 'RESOURCE_SEMAPHORE%')       AS [Memory Grant Waits],
+
+        GETDATE()                                          AS [Checked At];
+
+    SET NOCOUNT OFF;
+END;
+GO
+
+-- ──────────────────────
+-- USAGE
+-- ──────────────────────
+-- EXEC sp_memoryhealthcheck;
+
+
+
+i want to monitor the where is using the sql server memory and which alerts has been generated due to memory issue
